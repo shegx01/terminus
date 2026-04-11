@@ -148,11 +148,14 @@ async fn main() -> Result<()> {
             }
 
             _ = poll_interval.tick() => {
-                let tmux = session_mgr.tmux();
-                for buffer in buffers.values_mut() {
-                    let events = buffer.poll(tmux).await;
-                    for event in events {
-                        let _ = stream_tx.send(event);
+                // Only poll the foreground session — keeps cost low (one tmux subprocess per tick)
+                if let Some(fg) = session_mgr.foreground_session() {
+                    if let Some(buffer) = buffers.get_mut(fg) {
+                        let tmux = session_mgr.tmux();
+                        let events = buffer.poll(tmux).await;
+                        for event in events {
+                            let _ = stream_tx.send(event);
+                        }
                     }
                 }
             }

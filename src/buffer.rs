@@ -45,7 +45,6 @@ pub struct OutputBuffer {
     offline_buffer_max_bytes: usize,
     connected: bool,
     waiting_for_output: bool,    // true after snapshot_before_command
-    idle_polls: u32,              // consecutive polls with no new output
 }
 
 impl OutputBuffer {
@@ -58,7 +57,6 @@ impl OutputBuffer {
             offline_buffer_max_bytes,
             connected: true,
             waiting_for_output: false,
-            idle_polls: 0,
         }
     }
 
@@ -79,7 +77,6 @@ impl OutputBuffer {
         }
         self.last_command = command.map(|s| s.to_string());
         self.waiting_for_output = true;
-        self.idle_polls = 0;
     }
 
     /// Initialize the line offset to the current scrollback (call on session creation/reconnect).
@@ -106,14 +103,8 @@ impl OutputBuffer {
         let meaningful_count = count_meaningful_lines(&scrollback);
 
         if meaningful_count <= self.lines_seen {
-            // No new output — increment idle counter, stop polling after ~5s of no activity
-            self.idle_polls += 1;
-            if self.idle_polls > 20 {
-                self.waiting_for_output = false;
-            }
-            return events;
+            return events; // no new lines yet — keep polling
         }
-        self.idle_polls = 0; // reset on new output
 
         // Extract only the new lines (past our offset)
         // Take from the end of the meaningful lines
