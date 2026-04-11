@@ -10,6 +10,8 @@ pub enum ParsedCommand {
     KillSession { name: String },
     /// Send a prompt to Claude Code via the SDK (structured output, no terminal scraping)
     Claude { prompt: String },
+    /// Capture and send the current terminal screen
+    Screen,
     /// Enter interactive Claude mode — plain text routes to Claude instead of tmux
     ClaudeOn,
     /// Exit interactive Claude mode — plain text routes back to tmux
@@ -76,6 +78,10 @@ impl ParsedCommand {
 
             if rest == "list" {
                 return Ok(ParsedCommand::ListSessions);
+            }
+
+            if rest == "screen" {
+                return Ok(ParsedCommand::Screen);
             }
 
             // `: claude on/off` — toggle interactive Claude mode
@@ -320,5 +326,10 @@ mod tests {
     #[test]
     fn reject_multiline_stdin() {
         assert!(ParsedCommand::parse("line1\nline2").is_err());
+    }
+
+    #[test]
+    fn parse_screen() {
+        assert_eq!(ParsedCommand::parse(": screen").unwrap(), ParsedCommand::Screen);
     }
 }
