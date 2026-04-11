@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::tmux::TmuxClient;
 
 #[derive(Debug, Clone)]
@@ -17,31 +19,31 @@ pub enum StreamEvent {
     },
 }
 
-/// Captures terminal output using `tmux capture-pane` with scrollback line tracking.
+/// Captures terminal output by diffing tmux pane content between polls.
 ///
-/// Instead of diffing screen snapshots (fragile when content scrolls), this tracks
-/// the total number of scrollback lines seen. Each poll captures the full scrollback
-/// and only emits lines past the last-seen offset. This is analogous to file-offset
-/// tracking but using tmux's scrollback buffer as the source of truth.
+/// Uses content-based change detection: stores the raw capture text before
+/// each command, then on each poll compares the current capture to find
+/// new lines. This works regardless of scrollback buffer state, terminal
+/// size, or full-screen applications (alternate screen).
 ///
 /// For Telegram: each command's output is sent as a NEW message (not edited in place).
-/// This prevents the "wall of text" problem where edit-in-place accumulates the
-/// entire session history into one message.
 pub struct OutputBuffer {
     session_name: String,
-    lines_seen: usize,            // scrollback lines already delivered
-    last_command: Option<String>, // command text to strip from echo
+    /// Raw pane capture taken before the command was sent.
+    /// New output = lines in current capture that weren't in this snapshot.
+    snapshot: String,
+    last_command: Option<String>,
     offline_buffer: String,
     offline_buffer_max_bytes: usize,
     connected: bool,
-    waiting_for_output: bool, // true after snapshot_before_command
+    waiting_for_output: bool,
 }
 
 impl OutputBuffer {
     pub fn new(session_name: &str, offline_buffer_max_bytes: usize) -> Self {
         Self {
             session_name: session_name.to_string(),
-            lines_seen: 0,
+            snapshot: String::new(),
             last_command: None,
             offline_buffer: String::new(),
             offline_buffer_max_bytes,
@@ -60,25 +62,25 @@ impl OutputBuffer {
         self.connected = connected;
     }
 
-    /// Snapshot the current scrollback length before sending a command.
-    /// After this, `poll()` will only return lines added after this point.
+    /// Snapshot the current pane content before sending a command.
+    /// After this, `poll()` will detect changes by comparing against this snapshot.
     pub async fn snapshot_before_command(&mut self, tmux: &TmuxClient, command: Option<&str>) {
-        if let Ok(scrollback) = tmux.capture_pane_with_scrollback(&self.session_name).await {
-            // Count non-empty trailing lines to get the effective line count
-            self.lines_seen = count_meaningful_lines(&scrollback);
+        if let Ok(capture) = tmux.capture_pane_with_scrollback(&self.session_name).await {
+            self.snapshot = capture;
         }
         self.last_command = command.map(|s| s.to_string());
         self.waiting_for_output = true;
     }
 
-    /// Initialize the line offset to the current scrollback (call on session creation/reconnect).
+    /// Initialize the snapshot to the current pane content (call on session creation/reconnect).
     pub async fn sync_offset(&mut self, tmux: &TmuxClient) {
-        if let Ok(scrollback) = tmux.capture_pane_with_scrollback(&self.session_name).await {
-            self.lines_seen = count_meaningful_lines(&scrollback);
+        if let Ok(capture) = tmux.capture_pane_with_scrollback(&self.session_name).await {
+            self.snapshot = capture;
         }
     }
 
-    /// Poll for new output. Returns at most one StreamEvent per poll.
+    /// Poll for new output by comparing current pane content against the snapshot.
+    /// Returns new, non-noise lines as StreamEvents.
     pub async fn poll(&mut self, tmux: &TmuxClient) -> Vec<StreamEvent> {
         let mut events = Vec::new();
 
@@ -86,54 +88,39 @@ impl OutputBuffer {
             return events;
         }
 
-        let scrollback = match tmux.capture_pane_with_scrollback(&self.session_name).await {
+        let current = match tmux.capture_pane_with_scrollback(&self.session_name).await {
             Ok(s) => s,
             Err(_) => return events,
         };
 
-        let all_lines: Vec<&str> = scrollback.lines().collect();
-        let meaningful_count = count_meaningful_lines(&scrollback);
-
-        if meaningful_count <= self.lines_seen {
-            return events; // no new lines yet — keep polling
+        // Fast path: nothing changed
+        if current == self.snapshot {
+            return events;
         }
 
-        // Extract only the new lines (past our offset)
-        // Take from the end of the meaningful lines
-        let new_start = self.lines_seen;
-        let meaningful_lines: Vec<&str> = all_lines
-            .iter()
-            .copied()
-            .filter(|l| !l.trim().is_empty())
-            .collect();
+        tracing::info!("[poll {}] content changed ({} -> {} bytes)",
+            self.session_name, self.snapshot.len(), current.len());
 
-        let new_lines = if new_start < meaningful_lines.len() {
-            &meaningful_lines[new_start..]
-        } else {
-            return events;
-        };
+        // Content changed — find lines that are new (not in the snapshot).
+        // Use a set of snapshot lines for O(1) lookup.
+        let old_lines: HashSet<&str> = self.snapshot.lines().map(|l| l.trim()).collect();
 
-        // Filter out noise
         let cmd = self.last_command.take();
-        let filtered: Vec<&str> = new_lines
-            .iter()
-            .copied()
-            .filter(|line| !is_noise_line(line, cmd.as_deref()))
-            .collect();
+        let content: String = current
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter(|l| !old_lines.contains(l.trim()))
+            .filter(|l| !is_noise_line(l, cmd.as_deref()))
+            .collect::<Vec<&str>>()
+            .join("\n")
+            .trim()
+            .to_string();
 
-        if filtered.is_empty() {
-            // Lines were all noise — update offset but don't emit
-            self.lines_seen = meaningful_count;
-            return events;
-        }
-
-        let content = filtered.join("\n").trim().to_string();
+        // Update snapshot to current state so we don't re-emit the same output
+        self.snapshot = current;
         if content.is_empty() {
-            self.lines_seen = meaningful_count;
             return events;
         }
-
-        self.lines_seen = meaningful_count;
 
         if !self.connected {
             self.offline_buffer.push_str(&content);
@@ -142,7 +129,6 @@ impl OutputBuffer {
             return events;
         }
 
-        // Send as a new message — clean per-poll output chunk for Telegram.
         events.push(StreamEvent::NewMessage {
             session: self.session_name.clone(),
             content,
@@ -167,7 +153,6 @@ impl OutputBuffer {
     fn truncate_offline_buffer(&mut self) {
         if self.offline_buffer.len() > self.offline_buffer_max_bytes {
             let excess = self.offline_buffer.len() - self.offline_buffer_max_bytes;
-            // Find a safe char boundary at or after `excess`
             let safe_start = self.offline_buffer[excess..]
                 .char_indices()
                 .next()
@@ -178,11 +163,6 @@ impl OutputBuffer {
                 format!("{}{}", truncated_msg, &self.offline_buffer[safe_start..]);
         }
     }
-}
-
-/// Count non-empty lines in a scrollback capture.
-fn count_meaningful_lines(scrollback: &str) -> usize {
-    scrollback.lines().filter(|l| !l.trim().is_empty()).count()
 }
 
 /// Check if a single line is terminal noise (prompt, command echo, eval errors).
@@ -222,7 +202,6 @@ fn is_noise_line(line: &str, command: Option<&str>) -> bool {
     }
 
     // Starship prompt: contains git branch icon () followed by branch name
-    // More specific than just "on main" to avoid filtering git command output
     if t.contains(" on ") && (t.contains("\u{e0a0}") || t.contains("")) {
         return true;
     }
@@ -246,13 +225,6 @@ fn is_noise_line(line: &str, command: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn count_lines() {
-        assert_eq!(count_meaningful_lines("hello\nworld\n\n"), 2);
-        assert_eq!(count_meaningful_lines(""), 0);
-        assert_eq!(count_meaningful_lines("\n\n\n"), 0);
-    }
 
     #[test]
     fn noise_detection_eval_error() {
@@ -310,7 +282,6 @@ mod tests {
 
     #[test]
     fn git_output_not_noise() {
-        // "on main" in git output should NOT be filtered (only starship icon triggers it)
         assert!(!is_noise_line("On branch main", None));
         assert!(!is_noise_line("Switched to branch 'main'", None));
         assert!(!is_noise_line("Merge branch 'main' into feature", None));
@@ -320,11 +291,5 @@ mod tests {
     fn empty_line_not_noise() {
         assert!(!is_noise_line("", None));
         assert!(!is_noise_line("  ", None));
-    }
-
-    #[test]
-    fn multiline_count() {
-        let text = "hello\n\n\nworld\n\n";
-        assert_eq!(count_meaningful_lines(text), 2);
     }
 }
