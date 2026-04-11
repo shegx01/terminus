@@ -270,6 +270,35 @@ async fn handle_command(
                 send_reply(&msg.reply_context, &lines.join("\n"), telegram, slack).await;
             }
         }
+        ParsedCommand::Screen => {
+            match session_mgr.foreground_session() {
+                Some(fg) => {
+                    match session_mgr.tmux().capture_pane(fg).await {
+                        Ok(screen) => {
+                            let trimmed = screen.lines()
+                                .map(|l| l.trim_end())
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                                .trim()
+                                .to_string();
+                            if trimmed.is_empty() {
+                                send_reply(&msg.reply_context, "(empty screen)", telegram, slack).await;
+                            } else {
+                                for chunk in split_message(&trimmed, 4000) {
+                                    send_reply(&msg.reply_context, &chunk, telegram, slack).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            send_error(&msg.reply_context, &e.to_string(), telegram, slack).await;
+                        }
+                    }
+                }
+                None => {
+                    send_error(&msg.reply_context, "No active session", telegram, slack).await;
+                }
+            }
+        }
         ParsedCommand::KillSession { name } => {
             match session_mgr.kill(&name).await {
                 Ok(()) => {

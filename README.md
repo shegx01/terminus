@@ -164,6 +164,7 @@ All commands use the `: ` (colon + space) prefix:
 | `: bg` | Background the current session |
 | `: list` | Show all sessions with their status |
 | `: kill <name>` | Destroy a session |
+| `: screen` | Send a snapshot of the current terminal screen to chat |
 
 Session names can contain letters, numbers, hyphens, and underscores.
 
@@ -221,6 +222,14 @@ Switch between Claude and other sessions:
 : fg ai                          # back to Claude
 continue where we left off
 ```
+
+To check what Claude (or any program) is doing in a tmux session, use `: screen`:
+
+```
+: screen                         # sends a snapshot of the terminal to chat
+```
+
+This captures exactly what you'd see if you were looking at the terminal -- useful when Claude is working on a long task and you want a progress check.
 
 Use tmux mode when you need Claude Code's full interactive features (slash commands, permission prompts, multi-file editing workflows). Use SDK mode when you want quick, clean answers.
 
