@@ -1,7 +1,9 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
+use uuid::Uuid;
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -12,7 +14,9 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
-use super::{ChatPlatform, IncomingMessage, PlatformMessageId, PlatformType, ReplyContext};
+use super::{
+    Attachment, ChatPlatform, IncomingMessage, PlatformMessageId, PlatformType, ReplyContext,
+};
 
 pub struct SlackPlatform {
     bot_token: String,
@@ -127,7 +131,7 @@ impl SlackPlatform {
 
                     // Handle events_api messages
                     if payload.get("type").and_then(|v| v.as_str()) == Some("events_api") {
-                        if let Some(incoming) = self.parse_event(&payload) {
+                        if let Some(incoming) = self.parse_event(&payload).await {
                             if cmd_tx.send(incoming).await.is_err() {
                                 warn!("Command channel closed, stopping Slack listener");
                                 break;
@@ -153,23 +157,27 @@ impl SlackPlatform {
         Ok(())
     }
 
-    fn parse_event(&self, payload: &serde_json::Value) -> Option<IncomingMessage> {
+    async fn parse_event(&self, payload: &serde_json::Value) -> Option<IncomingMessage> {
         let event = payload.get("payload")?.get("event")?;
 
         if event.get("type").and_then(|v| v.as_str()) != Some("message") {
             return None;
         }
 
-        // Ignore bot messages and message subtypes (edits, deletes, joins, etc.)
+        // Ignore bot messages
         if event.get("bot_id").is_some() {
             return None;
         }
-        if event.get("subtype").is_some() {
-            return None;
+
+        // Allow file_share subtype; block all other subtypes (edits, deletes, joins, etc.)
+        let subtype = event.get("subtype").and_then(|v| v.as_str());
+        match subtype {
+            Some("file_share") => {} // allow user-uploaded files
+            Some(_) => return None,  // block edits, deletes, joins, etc.
+            None => {}               // normal text messages
         }
 
         let user = event.get("user").and_then(|v| v.as_str())?;
-        let text = event.get("text").and_then(|v| v.as_str())?;
         let channel = event
             .get("channel")
             .and_then(|v| v.as_str())
@@ -185,16 +193,175 @@ impl SlackPlatform {
             return None;
         }
 
+        // Extract and download image attachments
+        let attachments = self.extract_images(event).await;
+
+        // For file_share, prefer the initial_comment over the auto-generated text.
+        // Slack auto-generates text like "<@U123> uploaded a file: <url|name>" when
+        // there's no user caption — treat that as empty so photo-only messages work.
+        let text = if subtype == Some("file_share") {
+            let raw = event
+                .get("files")
+                .and_then(|f| f.get(0))
+                .and_then(|f| f.get("initial_comment"))
+                .and_then(|c| c.get("comment"))
+                .and_then(|v| v.as_str())
+                .or_else(|| event.get("text").and_then(|v| v.as_str()))
+                .unwrap_or("");
+            // Strip Slack's auto-generated upload text
+            if raw.contains("uploaded a file:") {
+                String::new()
+            } else {
+                raw.to_string()
+            }
+        } else {
+            event.get("text").and_then(|v| v.as_str())?.to_string()
+        };
+
+        // If there is no text and no attachments, skip the message
+        if text.is_empty() && attachments.is_empty() {
+            return None;
+        }
+
         Some(IncomingMessage {
             user_id: user.to_string(),
-            text: text.to_string(),
+            text,
             platform: PlatformType::Slack,
             reply_context: ReplyContext {
                 platform: PlatformType::Slack,
                 chat_id: channel.to_string(),
                 thread_ts,
             },
+            attachments,
         })
+    }
+
+    /// Download image files from a Slack event's `files` array.
+    /// Skips files that are not images, exceed 20 MB, or fail to download.
+    async fn extract_images(&self, event: &serde_json::Value) -> Vec<Attachment> {
+        let files = match event.get("files").and_then(|v| v.as_array()) {
+            Some(f) => f,
+            None => return vec![],
+        };
+
+        let mut attachments = Vec::new();
+
+        for file in files {
+            let mimetype = match file.get("mimetype").and_then(|v| v.as_str()) {
+                Some(m) => m,
+                None => continue,
+            };
+
+            if !mimetype.starts_with("image/") {
+                continue;
+            }
+
+            // Skip files larger than 20 MB
+            let size = file.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+            if size > 20 * 1024 * 1024 {
+                warn!("Skipping Slack image: size {} exceeds 20 MB limit", size);
+                continue;
+            }
+
+            let url = match file.get("url_private_download").and_then(|v| v.as_str()) {
+                Some(u) => u,
+                None => continue,
+            };
+
+            // SSRF prevention: only download from Slack's file hosting domain.
+            // Using exact match to prevent bypasses like evil-slack.com.
+            let is_slack_url = url::Url::parse(url)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h == "files.slack.com"))
+                .unwrap_or(false);
+            if !is_slack_url {
+                warn!("Rejecting non-Slack download URL: {}", url);
+                continue;
+            }
+
+            // Derive file extension from the original filename, defaulting to "jpg"
+            let original_name = file
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("image.jpg");
+            let ext = std::path::Path::new(original_name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("jpg");
+
+            let tmp_path = PathBuf::from(format!("/tmp/termbot-img-{}.{}", Uuid::new_v4(), ext));
+
+            let download_future = self
+                .http_client
+                .get(url)
+                .header("Authorization", format!("Bearer {}", self.bot_token))
+                .send();
+
+            let resp = match tokio::time::timeout(Duration::from_secs(30), download_future).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    warn!("Failed to download Slack image {}: {}", url, e);
+                    continue;
+                }
+                Err(_) => {
+                    warn!("Timeout downloading Slack image {}", url);
+                    continue;
+                }
+            };
+
+            let bytes = match tokio::time::timeout(Duration::from_secs(30), resp.bytes()).await {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => {
+                    warn!("Failed to read Slack image body {}: {}", url, e);
+                    continue;
+                }
+                Err(_) => {
+                    warn!("Timeout reading Slack image body {}", url);
+                    continue;
+                }
+            };
+
+            // Enforce actual body size limit (Slack metadata `size` field is untrusted)
+            if bytes.len() > 20 * 1024 * 1024 {
+                warn!(
+                    "Downloaded Slack image body exceeds 20 MB ({} bytes), discarding",
+                    bytes.len()
+                );
+                continue;
+            }
+
+            if let Err(e) = tokio::fs::write(&tmp_path, &bytes).await {
+                warn!("Failed to write Slack image to {:?}: {}", tmp_path, e);
+                continue;
+            }
+
+            attachments.push(Attachment {
+                path: tmp_path,
+                filename: original_name.to_string(),
+                media_type: mimetype.to_string(),
+            });
+        }
+
+        attachments
+    }
+
+    /// Guess MIME type from filename extension.
+    fn guess_mime(&self, filename: &str) -> String {
+        let ext = std::path::Path::new(filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match ext.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "bmp" => "image/bmp",
+            "tiff" | "tif" => "image/tiff",
+            _ => "application/octet-stream",
+        }
+        .to_string()
     }
 }
 
@@ -349,6 +516,83 @@ impl ChatPlatform for SlackPlatform {
                 .unwrap_or("unknown error");
             Err(anyhow!("chat.update failed: {}", err))
         }
+    }
+
+    async fn send_photo(
+        &self,
+        data: &[u8],
+        filename: &str,
+        caption: Option<&str>,
+        chat_id: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<PlatformMessageId> {
+        let mut form = reqwest::multipart::Form::new()
+            .text("channels", chat_id.to_string())
+            .text("filename", filename.to_string())
+            .part(
+                "file",
+                reqwest::multipart::Part::bytes(data.to_vec())
+                    .file_name(filename.to_string())
+                    .mime_str(&self.guess_mime(filename))?,
+            );
+
+        if let Some(ts) = thread_ts {
+            form = form.text("thread_ts", ts.to_string());
+        }
+        if let Some(cap) = caption {
+            form = form.text("initial_comment", cap.to_string());
+        }
+
+        // Use the legacy files.upload endpoint which accepts multipart directly.
+        // The v2 flow (getUploadURLExternal → upload → completeUploadExternal)
+        // is a three-step process that doesn't have a single endpoint.
+        let resp = self
+            .http_client
+            .post("https://slack.com/api/files.upload")
+            .header("Authorization", format!("Bearer {}", self.bot_token))
+            .multipart(form)
+            .send()
+            .await
+            .context("Failed to upload file to Slack")?;
+
+        let result: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse files.upload response")?;
+
+        if result.get("ok").and_then(|v| v.as_bool()).unwrap_or(false) {
+            // Extract the message ts from the file's share info if available
+            let ts = result
+                .pointer("/file/shares/public")
+                .or_else(|| result.pointer("/file/shares/private"))
+                .and_then(|shares| shares.as_object())
+                .and_then(|map| map.values().next())
+                .and_then(|arr| arr.get(0))
+                .and_then(|share| share.get("ts"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("uploaded")
+                .to_string();
+            Ok(PlatformMessageId::Slack(ts))
+        } else {
+            let err = result
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            Err(anyhow!("files.upload failed: {}", err))
+        }
+    }
+
+    async fn send_document(
+        &self,
+        data: &[u8],
+        filename: &str,
+        caption: Option<&str>,
+        chat_id: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<PlatformMessageId> {
+        // Slack's files.upload handles any file type — reuse the same logic as send_photo
+        self.send_photo(data, filename, caption, chat_id, thread_ts)
+            .await
     }
 
     fn is_connected(&self) -> bool {

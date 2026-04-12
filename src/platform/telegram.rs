@@ -1,16 +1,20 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use teloxide::net::default_reqwest_settings;
+use teloxide::net::{default_reqwest_settings, Download};
 use teloxide::payloads::GetUpdatesSetters;
 use teloxide::prelude::*;
-use teloxide::types::{AllowedUpdate, ChatId, UpdateKind};
+use teloxide::types::{AllowedUpdate, ChatId, InputFile, UpdateKind};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
+use uuid::Uuid;
 
-use super::{ChatPlatform, IncomingMessage, PlatformMessageId, PlatformType, ReplyContext};
+use super::{
+    Attachment, ChatPlatform, IncomingMessage, PlatformMessageId, PlatformType, ReplyContext,
+};
 
 pub struct TelegramAdapter {
     bot: teloxide::Bot,
@@ -105,16 +109,156 @@ impl ChatPlatform for TelegramAdapter {
                         continue;
                     }
 
-                    let text: String = match message.text() {
-                        Some(t) => t.to_string(),
-                        None => continue,
-                    };
+                    // Extract text from text messages or captions on photos/documents.
+                    let text: String = message
+                        .text()
+                        .or_else(|| message.caption())
+                        .unwrap_or("")
+                        .to_string();
+
+                    // Download any photo or image-document attachments.
+                    let mut attachments: Vec<Attachment> = Vec::new();
+
+                    // Photos: select the largest size (last element).
+                    if let Some(photos) = message.photo() {
+                        if let Some(photo) = photos.last() {
+                            if photo.file.size > 20 * 1024 * 1024 {
+                                tracing::warn!(
+                                    "Telegram: photo too large ({} bytes), skipping",
+                                    photo.file.size
+                                );
+                            } else {
+                                match bot.get_file(&photo.file.id).send().await {
+                                    Ok(tg_file) => {
+                                        let path = PathBuf::from(format!(
+                                            "/tmp/termbot-img-{}.jpg",
+                                            Uuid::new_v4()
+                                        ));
+                                        match tokio::fs::File::create(&path).await {
+                                            Ok(mut dst) => {
+                                                match bot
+                                                    .download_file(&tg_file.path, &mut dst)
+                                                    .await
+                                                {
+                                                    Ok(_) => {
+                                                        attachments.push(Attachment {
+                                                            filename: path
+                                                                .file_name()
+                                                                .unwrap()
+                                                                .to_string_lossy()
+                                                                .into_owned(),
+                                                            path,
+                                                            media_type: "image/jpeg".to_string(),
+                                                        });
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "Telegram: photo download failed: {}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Telegram: failed to create temp file: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Telegram: get_file failed for photo: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Documents with an image mime type.
+                    if let Some(doc) = message.document() {
+                        let media_type_str = doc
+                            .mime_type
+                            .as_ref()
+                            .map(|m| m.to_string())
+                            .unwrap_or_default();
+                        let is_image = media_type_str.starts_with("image/");
+                        if is_image {
+                            let media_type = media_type_str.clone();
+                            // Derive a file extension from the subtype (e.g. "image/png" -> "png").
+                            let ext = media_type_str.strip_prefix("image/").unwrap_or("bin");
+
+                            if doc.file.size > 20 * 1024 * 1024 {
+                                tracing::warn!(
+                                    "Telegram: document too large ({} bytes), skipping",
+                                    doc.file.size
+                                );
+                            } else {
+                                match bot.get_file(&doc.file.id).send().await {
+                                    Ok(tg_file) => {
+                                        let path = PathBuf::from(format!(
+                                            "/tmp/termbot-img-{}.{}",
+                                            Uuid::new_v4(),
+                                            ext
+                                        ));
+                                        match tokio::fs::File::create(&path).await {
+                                            Ok(mut dst) => {
+                                                match bot
+                                                    .download_file(&tg_file.path, &mut dst)
+                                                    .await
+                                                {
+                                                    Ok(_) => {
+                                                        attachments.push(Attachment {
+                                                            filename: path
+                                                                .file_name()
+                                                                .unwrap()
+                                                                .to_string_lossy()
+                                                                .into_owned(),
+                                                            path,
+                                                            media_type,
+                                                        });
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(
+                                                            "Telegram: document download failed: {}",
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "Telegram: failed to create temp file for document: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Telegram: get_file failed for document: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Skip messages with no text and no attachments.
+                    if text.is_empty() && attachments.is_empty() {
+                        continue;
+                    }
 
                     let chat_id = message.chat.id.0.to_string();
                     tracing::debug!(
-                        "Telegram: received message from chat {} ({} chars)",
+                        "Telegram: received message from chat {} ({} chars, {} attachments)",
                         chat_id,
-                        text.len()
+                        text.len(),
+                        attachments.len()
                     );
 
                     let incoming = IncomingMessage {
@@ -126,6 +270,7 @@ impl ChatPlatform for TelegramAdapter {
                             chat_id,
                             thread_ts: None,
                         },
+                        attachments,
                     };
 
                     if cmd_tx.send(incoming).await.is_err() {
@@ -212,6 +357,46 @@ impl ChatPlatform for TelegramAdapter {
             .map_err(|e| anyhow!("Telegram edit_message_text failed: {}", e))?;
 
         Ok(())
+    }
+
+    async fn send_photo(
+        &self,
+        data: &[u8],
+        filename: &str,
+        caption: Option<&str>,
+        chat_id: &str,
+        _thread_ts: Option<&str>,
+    ) -> Result<PlatformMessageId> {
+        let chat_id_i64 = Self::parse_chat_id(chat_id)?;
+        let input = InputFile::memory(data.to_vec()).file_name(filename.to_string());
+        let mut req = self.bot.send_photo(ChatId(chat_id_i64), input);
+        if let Some(cap) = caption {
+            req = req.caption(cap);
+        }
+        let msg = req
+            .await
+            .map_err(|e| anyhow!("Telegram send_photo failed: {}", e))?;
+        Ok(PlatformMessageId::Telegram(msg.id.0))
+    }
+
+    async fn send_document(
+        &self,
+        data: &[u8],
+        filename: &str,
+        caption: Option<&str>,
+        chat_id: &str,
+        _thread_ts: Option<&str>,
+    ) -> Result<PlatformMessageId> {
+        let chat_id_i64 = Self::parse_chat_id(chat_id)?;
+        let input = InputFile::memory(data.to_vec()).file_name(filename.to_string());
+        let mut req = self.bot.send_document(ChatId(chat_id_i64), input);
+        if let Some(cap) = caption {
+            req = req.caption(cap);
+        }
+        let msg = req
+            .await
+            .map_err(|e| anyhow!("Telegram send_document failed: {}", e))?;
+        Ok(PlatformMessageId::Telegram(msg.id.0))
     }
 
     fn is_connected(&self) -> bool {
