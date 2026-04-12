@@ -51,7 +51,7 @@ _DOWNLOADED_VERSION=""
 # Global state (set by interactive prompts)
 # =============================================================================
 
-PLATFORM=""          # telegram | slack | both
+PLATFORM="" # telegram | slack | both
 TG_BOT_TOKEN=""
 TG_USER_ID=""
 SL_BOT_TOKEN=""
@@ -80,8 +80,16 @@ setup_colors() {
     NC='\033[0m'
     # Use fancy glyphs only in UTF-8 locales
     case "${LANG:-}${LC_ALL:-}${LC_CTYPE:-}" in
-      *[Uu][Tt][Ff][-_]8*) TICK='✓'; CROSS='✗'; ARROW='▸' ;;
-      *)                    TICK='+'; CROSS='x'; ARROW='>' ;;
+      *[Uu][Tt][Ff][-_]8*)
+        TICK='✓'
+        CROSS='✗'
+        ARROW='▸'
+        ;;
+      *)
+        TICK='+'
+        CROSS='x'
+        ARROW='>'
+        ;;
     esac
   else
     RED='' GREEN='' YELLOW='' BLUE='' CYAN='' BOLD='' DIM='' NC=''
@@ -103,11 +111,11 @@ cleanup() {
 # Output helpers (all go to stderr to keep stdout clean)
 # =============================================================================
 
-info()    { printf "  %b%s%b %s\n" "$GREEN" "$TICK" "$NC" "$1" >&2; }
-warn()    { printf "  %b!%b %s\n" "$YELLOW" "$NC" "$1" >&2; }
-error()   { printf "  %b%s%b %s\n" "$RED" "$CROSS" "$NC" "$1" >&2; }
-step()    { printf "\n%b%b%s %s%b\n" "$BOLD" "$BLUE" "$ARROW" "$1" "$NC" >&2; }
-hint()    { if [ "$QUICK" = false ]; then printf "    %b%s%b\n" "$DIM" "$1" "$NC" >&2; fi; }
+info() { printf "  %b%s%b %s\n" "$GREEN" "$TICK" "$NC" "$1" >&2; }
+warn() { printf "  %b!%b %s\n" "$YELLOW" "$NC" "$1" >&2; }
+error() { printf "  %b%s%b %s\n" "$RED" "$CROSS" "$NC" "$1" >&2; }
+step() { printf "\n%b%b%s %s%b\n" "$BOLD" "$BLUE" "$ARROW" "$1" "$NC" >&2; }
+hint() { if [ "$QUICK" = false ]; then printf "    %b%s%b\n" "$DIM" "$1" "$NC" >&2; fi; }
 hint_always() { printf "    %b%s%b\n" "$DIM" "$1" "$NC" >&2; }
 
 # =============================================================================
@@ -125,7 +133,7 @@ prompt() {
     printf "  %b%s%b: " "$BOLD" "$message" "$NC" >&2
   fi
 
-  read -r result < /dev/tty || true
+  read -r result </dev/tty || true
 
   # Strip leading/trailing whitespace (common paste artifacts)
   result="$(printf '%s' "$result" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
@@ -150,7 +158,7 @@ prompt_choice() {
   done
   printf "  %b>%b " "$BOLD" "$NC" >&2
 
-  read -r choice < /dev/tty || true
+  read -r choice </dev/tty || true
   printf "%s" "$choice"
 }
 
@@ -166,14 +174,14 @@ prompt_yn() {
       printf "  %b%s%b [y/N]: " "$BOLD" "$message" "$NC" >&2
     fi
 
-    read -r result < /dev/tty || true
+    read -r result </dev/tty || true
     result="${result:-$default}"
     result="$(printf "%s" "$result" | tr '[:upper:]' '[:lower:]')"
 
     case "$result" in
-      y|yes) return 0 ;;
-      n|no)  return 1 ;;
-      *)     warn "Please answer y or n." ;;
+      y | yes) return 0 ;;
+      n | no) return 1 ;;
+      *) warn "Please answer y or n." ;;
     esac
   done
 }
@@ -218,7 +226,7 @@ sanitize_toml_value() {
   # Note: $'\n' is used instead of $(printf '\n') because command
   # substitution strips trailing newlines, producing an empty match.
   case "$val" in
-    *$'\n'*|*$'\r'*|*$'\t'*)
+    *$'\n'* | *$'\r'* | *$'\t'*)
       error "Input contains invalid characters (control characters not allowed)."
       exit 1
       ;;
@@ -267,16 +275,22 @@ notify_os() {
 detect_os() {
   case "$(uname -s)" in
     Darwin) printf "macos" ;;
-    Linux)  printf "linux" ;;
-    *)      error "Unsupported OS: $(uname -s). termbot supports macOS and Linux."; exit 1 ;;
+    Linux) printf "linux" ;;
+    *)
+      error "Unsupported OS: $(uname -s). termbot supports macOS and Linux."
+      exit 1
+      ;;
   esac
 }
 
 detect_arch() {
   case "$(uname -m)" in
-    x86_64|amd64)  printf "x86_64" ;;
-    aarch64|arm64) printf "aarch64" ;;
-    *)             error "Unsupported architecture: $(uname -m)"; exit 1 ;;
+    x86_64 | amd64) printf "x86_64" ;;
+    aarch64 | arm64) printf "aarch64" ;;
+    *)
+      error "Unsupported architecture: $(uname -m)"
+      exit 1
+      ;;
   esac
 }
 
@@ -286,11 +300,14 @@ get_target() {
   arch="$(detect_arch)"
 
   case "${os}-${arch}" in
-    macos-x86_64)  printf "x86_64-apple-darwin" ;;
+    macos-x86_64) printf "x86_64-apple-darwin" ;;
     macos-aarch64) printf "aarch64-apple-darwin" ;;
-    linux-x86_64)  printf "x86_64-unknown-linux-gnu" ;;
+    linux-x86_64) printf "x86_64-unknown-linux-gnu" ;;
     linux-aarch64) printf "aarch64-unknown-linux-gnu" ;;
-    *)             error "No pre-built binary for ${os} ${arch}"; exit 1 ;;
+    *)
+      error "No pre-built binary for ${os} ${arch}"
+      exit 1
+      ;;
   esac
 }
 
@@ -352,11 +369,11 @@ install_tmux() {
 
   local install_ok=true
   case "$pm" in
-    brew)   brew install tmux >&2                                            || install_ok=false ;;
-    apt)    (sudo apt-get update -qq >&2 && sudo apt-get install -y tmux >&2) || install_ok=false ;;
-    dnf)    sudo dnf install -y tmux >&2                                     || install_ok=false ;;
-    yum)    sudo yum install -y tmux >&2                                     || install_ok=false ;;
-    pacman) sudo pacman -S --noconfirm tmux >&2                              || install_ok=false ;;
+    brew) brew install tmux >&2 || install_ok=false ;;
+    apt) (sudo apt-get update -qq >&2 && sudo apt-get install -y tmux >&2) || install_ok=false ;;
+    dnf) sudo dnf install -y tmux >&2 || install_ok=false ;;
+    yum) sudo yum install -y tmux >&2 || install_ok=false ;;
+    pacman) sudo pacman -S --noconfirm tmux >&2 || install_ok=false ;;
   esac
 
   if command -v tmux >/dev/null 2>&1; then
@@ -386,46 +403,46 @@ check_claude() {
 validate_telegram_token() {
   # Real format: digits:alphanumeric-underscore  e.g. 7012345678:AAHxyz_abc-123
   case "$1" in
-    *[!0-9A-Za-z:_-]*) return 1 ;;   # reject chars outside allowed set
-    [0-9]*:*)           return 0 ;;   # must start with digits, contain colon
-    *)                  return 1 ;;
+    *[!0-9A-Za-z:_-]*) return 1 ;; # reject chars outside allowed set
+    [0-9]*:*) return 0 ;;          # must start with digits, contain colon
+    *) return 1 ;;
   esac
 }
 
 validate_telegram_user_id() {
   case "$1" in
-    ''|*[!0-9]*) return 1 ;;
-    *)           return 0 ;;
+    '' | *[!0-9]*) return 1 ;;
+    *) return 0 ;;
   esac
 }
 
 validate_slack_bot_token() {
   case "$1" in
-    *[!0-9A-Za-z_-]*) return 1 ;;    # reject non-token chars
-    xoxb-*)            return 0 ;;
-    *)                 return 1 ;;
+    *[!0-9A-Za-z_-]*) return 1 ;; # reject non-token chars
+    xoxb-*) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
 validate_slack_app_token() {
   case "$1" in
     *[!0-9A-Za-z_-]*) return 1 ;;
-    xapp-*)            return 0 ;;
-    *)                 return 1 ;;
+    xapp-*) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
 validate_slack_user_id() {
   case "$1" in
     U[A-Z0-9]*) return 0 ;;
-    *)           return 1 ;;
+    *) return 1 ;;
   esac
 }
 
 validate_slack_channel_id() {
   case "$1" in
     C[A-Z0-9]*) return 0 ;;
-    *)           return 1 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -439,9 +456,18 @@ prompt_platform_choice() {
     choice="$(prompt_choice "Which platform will you use?" "Telegram" "Slack" "Both")"
 
     case "$choice" in
-      1) PLATFORM="telegram"; return ;;
-      2) PLATFORM="slack";    return ;;
-      3) PLATFORM="both";     return ;;
+      1)
+        PLATFORM="telegram"
+        return
+        ;;
+      2)
+        PLATFORM="slack"
+        return
+        ;;
+      3)
+        PLATFORM="both"
+        return
+        ;;
       *) warn "Invalid choice -- enter 1, 2, or 3." ;;
     esac
   done
@@ -626,7 +652,7 @@ chunk_size = 4000
 offline_buffer_max_bytes = 1048576
 max_sessions = 10
 STREAMING
-  } > "$CONFIG_FILE"
+  } >"$CONFIG_FILE"
 
   chmod 600 "$CONFIG_FILE"
   umask "$old_umask"
@@ -773,7 +799,8 @@ download_binary() {
   if [ -f "$BINARY_PATH" ]; then
     if ! cp "$BINARY_PATH" "$BACKUP_PATH"; then
       error "Failed to back up existing binary. Check disk space and permissions."
-      rm -f "$_TMP_FILE"; _TMP_FILE=""
+      rm -f "$_TMP_FILE"
+      _TMP_FILE=""
       exit 1
     fi
     info "Previous binary backed up to ${BACKUP_PATH}"
@@ -784,7 +811,7 @@ download_binary() {
     _TMP_FILE=""
     exit 1
   fi
-  _TMP_FILE=""    # clear so cleanup trap doesn't remove the installed binary
+  _TMP_FILE="" # clear so cleanup trap doesn't remove the installed binary
   info "Binary installed to ${BINARY_PATH}"
 
   # Version is recorded by the caller (do_install/do_upgrade) after
@@ -806,16 +833,16 @@ ensure_path() {
 
   local shell_rc=""
   case "${SHELL:-/bin/bash}" in
-    */zsh)  shell_rc="${HOME}/.zshrc" ;;
+    */zsh) shell_rc="${HOME}/.zshrc" ;;
     */bash) shell_rc="${HOME}/.bashrc" ;;
-    *)      shell_rc="${HOME}/.profile" ;;
+    *) shell_rc="${HOME}/.profile" ;;
   esac
 
   if prompt_yn "Add ${INSTALL_DIR} to PATH in ${shell_rc}?"; then
     if grep -qF "# Added by termbot installer" "$shell_rc" 2>/dev/null; then
       info "PATH entry already exists in ${shell_rc}"
     else
-      printf '\n# Added by termbot installer\nexport PATH="%s:${PATH}"\n' "$INSTALL_DIR" >> "$shell_rc"
+      printf '\n# Added by termbot installer\nexport PATH="%s:${PATH}"\n' "$INSTALL_DIR" >>"$shell_rc"
     fi
     info "PATH updated in ${shell_rc}"
     hint_always "Run: source ${shell_rc}  (or open a new terminal)"
@@ -879,7 +906,7 @@ install_service_linux() {
   mkdir -p "$LOG_DIR"
   chmod 700 "$LOG_DIR"
 
-  cat > "$SYSTEMD_SERVICE" <<EOF
+  cat >"$SYSTEMD_SERVICE" <<EOF
 [Unit]
 Description=termbot - terminal control from Telegram/Slack
 After=network-online.target
@@ -932,7 +959,7 @@ install_update_timer_linux() {
   local svc_path
   svc_path="$(build_service_path)"
 
-  cat > "$SYSTEMD_UPDATE_SERVICE" <<EOF
+  cat >"$SYSTEMD_UPDATE_SERVICE" <<EOF
 [Unit]
 Description=Check for termbot updates
 
@@ -942,7 +969,7 @@ ExecStart="${UPDATE_CHECK_PATH}"
 Environment=PATH=${svc_path}
 EOF
 
-  cat > "$SYSTEMD_UPDATE_TIMER" <<EOF
+  cat >"$SYSTEMD_UPDATE_TIMER" <<EOF
 [Unit]
 Description=Daily termbot update check
 
@@ -974,7 +1001,7 @@ install_service_macos() {
   mkdir -p "$LOG_DIR"
   chmod 700 "$LOG_DIR"
 
-  cat > "$LAUNCHD_SERVICE" <<EOF
+  cat >"$LAUNCHD_SERVICE" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1017,7 +1044,7 @@ EOF
 install_update_timer_macos() {
   step "Installing daily update check"
 
-  cat > "$LAUNCHD_UPDATE" <<EOF
+  cat >"$LAUNCHD_UPDATE" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1048,7 +1075,7 @@ EOF
 
 # macOS crash-notification wrapper (launchd lacks ExecStopPost)
 write_wrapper_script() {
-  cat > "$WRAPPER_PATH" <<EOF
+  cat >"$WRAPPER_PATH" <<EOF
 #!/usr/bin/env bash
 # termbot wrapper — forward signals, notify on crash
 if [ ! -x "${BINARY_PATH}" ]; then
@@ -1076,7 +1103,7 @@ EOF
 # =============================================================================
 
 write_update_check_script() {
-  cat > "$UPDATE_CHECK_PATH" <<'OUTER'
+  cat >"$UPDATE_CHECK_PATH" <<'OUTER'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -1187,7 +1214,7 @@ start_service() {
         systemctl --user start termbot.service || true
       else
         # No systemd — start directly in background
-        TERMBOT_CONFIG="$CONFIG_FILE" nohup "$BINARY_PATH" >> "${LOG_DIR}/termbot.log" 2>&1 &
+        TERMBOT_CONFIG="$CONFIG_FILE" nohup "$BINARY_PATH" >>"${LOG_DIR}/termbot.log" 2>&1 &
       fi
       ;;
   esac
@@ -1242,7 +1269,8 @@ restart_service() {
       # Wait for old process to actually exit (up to 10 seconds)
       local i=0
       while pgrep -x termbot >/dev/null 2>&1 && [ $i -lt 10 ]; do
-        sleep 1; i=$((i + 1))
+        sleep 1
+        i=$((i + 1))
       done
       launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_SERVICE" 2>/dev/null \
         || launchctl load "$LAUNCHD_SERVICE" 2>/dev/null \
@@ -1257,7 +1285,7 @@ restart_service() {
       else
         pkill -x termbot 2>/dev/null || true
         sleep 1
-        TERMBOT_CONFIG="$CONFIG_FILE" nohup "$BINARY_PATH" >> "${LOG_DIR}/termbot.log" 2>&1 &
+        TERMBOT_CONFIG="$CONFIG_FILE" nohup "$BINARY_PATH" >>"${LOG_DIR}/termbot.log" 2>&1 &
       fi
       ;;
   esac
@@ -1304,7 +1332,7 @@ do_install() {
       do_upgrade
       return
     elif prompt_yn "Reinstall from scratch? (config will be preserved)"; then
-      stop_service   # stop before replacing the binary
+      stop_service # stop before replacing the binary
     else
       info "No changes made."
       exit 0
@@ -1365,7 +1393,7 @@ do_install() {
   # Record version only after successful start
   mkdir -p "$CONFIG_DIR"
   if [ -n "$_DOWNLOADED_VERSION" ] && [ "$_DOWNLOADED_VERSION" != "unknown" ]; then
-    printf "%s" "$_DOWNLOADED_VERSION" > "$VERSION_FILE"
+    printf "%s" "$_DOWNLOADED_VERSION" >"$VERSION_FILE"
   fi
 
   # Summary
@@ -1459,14 +1487,14 @@ do_upgrade() {
     # Record version only after verified start
     mkdir -p "$CONFIG_DIR"
     if [ -n "$_DOWNLOADED_VERSION" ] && [ "$_DOWNLOADED_VERSION" != "unknown" ]; then
-      printf "%s" "$_DOWNLOADED_VERSION" > "$VERSION_FILE"
+      printf "%s" "$_DOWNLOADED_VERSION" >"$VERSION_FILE"
     fi
   else
     warn "New version failed to start. Auto-rolling back..."
     if [ -f "$BACKUP_PATH" ]; then
       mv "$BACKUP_PATH" "$BINARY_PATH"
       if [ -n "$installed_version" ] && [ "$installed_version" != "unknown" ]; then
-        printf "%s" "$installed_version" > "$VERSION_FILE"
+        printf "%s" "$installed_version" >"$VERSION_FILE"
       fi
       restart_service
       sleep 2
@@ -1507,12 +1535,18 @@ do_uninstall() {
   case "$os" in
     macos)
       for f in "$LAUNCHD_SERVICE" "$LAUNCHD_UPDATE"; do
-        if [ -f "$f" ]; then rm -f "$f"; info "Removed ${f}"; fi
+        if [ -f "$f" ]; then
+          rm -f "$f"
+          info "Removed ${f}"
+        fi
       done
       ;;
     linux)
       for f in "$SYSTEMD_SERVICE" "$SYSTEMD_UPDATE_SERVICE" "$SYSTEMD_UPDATE_TIMER"; do
-        if [ -f "$f" ]; then rm -f "$f"; info "Removed ${f}"; fi
+        if [ -f "$f" ]; then
+          rm -f "$f"
+          info "Removed ${f}"
+        fi
       done
       if has_systemd; then
         ensure_user_bus
@@ -1621,11 +1655,27 @@ HELPEOF
 parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
-      --quick|-q)     QUICK=true;     shift ;;
-      --upgrade|-u)   UPGRADE=true;   shift ;;
-      --uninstall|--remove) UNINSTALL=true; shift ;;
-      --help|-h)      show_help; exit 0 ;;
-      *)              error "Unknown option: $1"; show_help; exit 1 ;;
+      --quick | -q)
+        QUICK=true
+        shift
+        ;;
+      --upgrade | -u)
+        UPGRADE=true
+        shift
+        ;;
+      --uninstall | --remove)
+        UNINSTALL=true
+        shift
+        ;;
+      --help | -h)
+        show_help
+        exit 0
+        ;;
+      *)
+        error "Unknown option: $1"
+        show_help
+        exit 1
+        ;;
     esac
   done
 }
