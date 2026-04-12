@@ -1,6 +1,8 @@
 pub mod slack;
 pub mod telegram;
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -18,6 +20,16 @@ pub enum PlatformMessageId {
     Slack(String), // message ts
 }
 
+/// An image or file attachment downloaded to a temp file.
+#[derive(Debug, Clone)]
+pub struct Attachment {
+    pub path: PathBuf,
+    #[allow(dead_code)]
+    pub filename: String,
+    #[allow(dead_code)]
+    pub media_type: String, // e.g. "image/jpeg", "image/png"
+}
+
 #[derive(Debug, Clone)]
 pub struct IncomingMessage {
     #[allow(dead_code)]
@@ -26,6 +38,7 @@ pub struct IncomingMessage {
     #[allow(dead_code)]
     pub platform: PlatformType,
     pub reply_context: ReplyContext,
+    pub attachments: Vec<Attachment>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +64,22 @@ pub trait ChatPlatform: Send + Sync {
         chat_id: &str,
         text: &str,
     ) -> Result<()>;
+    async fn send_photo(
+        &self,
+        data: &[u8],
+        filename: &str,
+        caption: Option<&str>,
+        chat_id: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<PlatformMessageId>;
+    async fn send_document(
+        &self,
+        data: &[u8],
+        filename: &str,
+        caption: Option<&str>,
+        chat_id: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<PlatformMessageId>;
     #[allow(dead_code)]
     fn is_connected(&self) -> bool;
     fn platform_type(&self) -> PlatformType;

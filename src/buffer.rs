@@ -98,8 +98,12 @@ impl OutputBuffer {
             return events;
         }
 
-        tracing::info!("[poll {}] content changed ({} -> {} bytes)",
-            self.session_name, self.snapshot.len(), current.len());
+        tracing::info!(
+            "[poll {}] content changed ({} -> {} bytes)",
+            self.session_name,
+            self.snapshot.len(),
+            current.len()
+        );
 
         // Content changed — find lines that are new (not in the snapshot).
         // Use a set of snapshot lines for O(1) lookup.

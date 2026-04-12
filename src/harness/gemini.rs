@@ -1,4 +1,5 @@
 use super::{Harness, HarnessEvent, HarnessKind};
+use crate::platform::Attachment;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
@@ -20,10 +21,11 @@ impl Harness for GeminiHarness {
     async fn run_prompt(
         &self,
         _prompt: &str,
+        _attachments: &[Attachment],
         _cwd: &Path,
         _session_id: Option<&str>,
     ) -> Result<mpsc::Receiver<HarnessEvent>> {
-        todo!("Gemini harness not yet implemented")
+        Err(anyhow::anyhow!("Gemini harness not yet implemented"))
     }
 
     fn get_session_id(&self, _session_name: &str) -> Option<String> {

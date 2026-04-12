@@ -20,7 +20,7 @@ use harness::claude::ClaudeHarness;
 use harness::{drive_harness, Harness, HarnessKind};
 use platform::slack::SlackPlatform;
 use platform::telegram::TelegramAdapter;
-use platform::{ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
+use platform::{Attachment, ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
 use session::SessionManager;
 use tmux::TmuxClient;
 
@@ -207,7 +207,22 @@ async fn handle_command(
         }
     };
 
-    tracing::info!("handle_command: {:?} (fg={:?})", cmd, session_mgr.foreground_session());
+    tracing::info!(
+        "handle_command: {:?} (fg={:?})",
+        cmd,
+        session_mgr.foreground_session()
+    );
+
+    // Clean up image temp files for commands that won't route to a harness.
+    // Harness paths (HarnessPrompt, StdinInput→harness) handle their own cleanup
+    // inside the spawned harness task.
+    let harness_will_handle = matches!(
+        cmd,
+        ParsedCommand::HarnessPrompt { .. } | ParsedCommand::StdinInput { .. }
+    );
+    if !harness_will_handle && !msg.attachments.is_empty() {
+        cleanup_attachments(&msg.attachments).await;
+    }
 
     // Always bind the foreground session to the current chat context.
     // This ensures delivery tasks know where to send output — critical after
@@ -475,6 +490,7 @@ async fn handle_command(
             ref prompt,
         } => {
             if blocklist.is_blocked(prompt) {
+                cleanup_attachments(&msg.attachments).await;
                 send_error(
                     &msg.reply_context,
                     &format!("{} prompt blocked by security policy", kind.name()),
@@ -487,6 +503,7 @@ async fn handle_command(
                     &msg.reply_context,
                     &kind,
                     prompt,
+                    &msg.attachments,
                     session_mgr,
                     harnesses,
                     telegram,
@@ -521,6 +538,7 @@ async fn handle_command(
         ParsedCommand::StdinInput { text } => {
             // Single blocklist check regardless of routing
             if blocklist.is_blocked(&text) {
+                cleanup_attachments(&msg.attachments).await;
                 send_error(
                     &msg.reply_context,
                     "Command blocked by security policy",
@@ -536,6 +554,7 @@ async fn handle_command(
                     &msg.reply_context,
                     &kind,
                     &text,
+                    &msg.attachments,
                     session_mgr,
                     harnesses,
                     telegram,
@@ -543,6 +562,18 @@ async fn handle_command(
                 )
                 .await;
             } else {
+                // Images are only supported in harness mode
+                if !msg.attachments.is_empty() {
+                    cleanup_attachments(&msg.attachments).await;
+                    send_error(
+                        &msg.reply_context,
+                        "Images are only supported in harness mode. Use `: claude on` first.",
+                        telegram,
+                        slack,
+                    )
+                    .await;
+                    return;
+                }
                 // Route to terminal
                 if let Some(fg) = session_mgr.foreground_session() {
                     if let Some(buf) = buffers.get_mut(fg) {
@@ -563,6 +594,7 @@ async fn send_harness_prompt(
     ctx: &ReplyContext,
     kind: &HarnessKind,
     prompt: &str,
+    attachments: &[platform::Attachment],
     session_mgr: &SessionManager,
     harnesses: &HashMap<HarnessKind, Box<dyn Harness>>,
     telegram: Option<&dyn ChatPlatform>,
@@ -590,12 +622,11 @@ async fn send_harness_prompt(
     let cwd = std::env::current_dir().unwrap_or_default();
 
     match harness
-        .run_prompt(prompt, &cwd, resume_id.as_deref())
+        .run_prompt(prompt, attachments, &cwd, resume_id.as_deref())
         .await
     {
         Ok(event_rx) => {
-            let (got_output, session_id) =
-                drive_harness(event_rx, ctx, telegram, slack).await;
+            let (got_output, session_id) = drive_harness(event_rx, ctx, telegram, slack).await;
             if let Some(sid) = session_id {
                 harness.set_session_id(&session_name, sid);
             }
@@ -610,13 +641,7 @@ async fn send_harness_prompt(
             }
         }
         Err(e) => {
-            send_error(
-                ctx,
-                &format!("{}: {}", kind.name(), e),
-                telegram,
-                slack,
-            )
-            .await;
+            send_error(ctx, &format!("{}: {}", kind.name(), e), telegram, slack).await;
         }
     }
 }
@@ -685,6 +710,14 @@ async fn send_error(
     send_reply(ctx, &format!("Error: {}", error), telegram, slack).await;
 }
 
+/// Clean up temp files from attachments that won't reach the harness
+/// (which normally handles its own cleanup in the spawned task).
+async fn cleanup_attachments(attachments: &[Attachment]) {
+    for att in attachments {
+        let _ = tokio::fs::remove_file(&att.path).await;
+    }
+}
+
 fn spawn_delivery_task(platform: Arc<dyn ChatPlatform>, mut rx: broadcast::Receiver<StreamEvent>) {
     tokio::spawn(async move {
         let mut session_chat_ids: HashMap<String, String> = HashMap::new();
@@ -738,7 +771,8 @@ async fn handle_stream_event(
                 None => {
                     tracing::warn!(
                         "[delivery] no chat_id for session '{}', dropping message ({} chars)",
-                        session, content.len()
+                        session,
+                        content.len()
                     );
                     return;
                 }
@@ -781,6 +815,11 @@ async fn reconcile_startup(
             let name_str = name.to_string_lossy();
             if name_str.starts_with("termbot-") && name_str.ends_with(".out") {
                 tracing::info!("Cleaning stale output file: {}", entry.path().display());
+                let _ = std::fs::remove_file(entry.path());
+            }
+            // Clean stale image temp files from previous runs
+            if name_str.starts_with("termbot-img-") {
+                tracing::info!("Cleaning stale image temp file: {}", entry.path().display());
                 let _ = std::fs::remove_file(entry.path());
             }
         }

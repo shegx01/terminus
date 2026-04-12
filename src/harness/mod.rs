@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use std::path::Path;
 use tokio::sync::mpsc;
 
-use crate::platform::{ChatPlatform, ReplyContext};
+use crate::platform::{Attachment, ChatPlatform, PlatformType, ReplyContext};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HarnessKind {
@@ -44,6 +44,12 @@ pub enum HarnessEvent {
     ToolUse { tool: String, description: String },
     /// Text from the harness response
     Text(String),
+    /// A file produced by the harness (image, document, data file, etc.)
+    File {
+        data: Vec<u8>,
+        media_type: String,
+        filename: String,
+    },
     /// Session completed
     Done { session_id: String },
     /// An error occurred
@@ -62,6 +68,7 @@ pub trait Harness: Send + Sync {
     async fn run_prompt(
         &self,
         prompt: &str,
+        attachments: &[Attachment],
         cwd: &Path,
         session_id: Option<&str>,
     ) -> Result<mpsc::Receiver<HarnessEvent>>;
@@ -72,7 +79,7 @@ pub trait Harness: Send + Sync {
     fn set_session_id(&self, session_name: &str, id: String);
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
@@ -185,6 +192,31 @@ pub async fn drive_harness(
                 }
                 break;
             }
+            HarnessEvent::File {
+                data,
+                ref media_type,
+                ref filename,
+            } => {
+                got_any_output = true;
+                // Flush pending tool lines first
+                if !tool_lines.is_empty() {
+                    if consecutive_count > 0 {
+                        if let Some(last) = tool_lines.last_mut() {
+                            *last = format!("{} (+{} more)", last, consecutive_count);
+                        }
+                        consecutive_count = 0;
+                    }
+                    send_reply(ctx, &tool_lines.join("\n"), telegram, slack).await;
+                    tool_lines.clear();
+                    last_tool_name = None;
+                }
+                // Route images to send_photo (native preview), documents to send_document
+                if media_type.starts_with("image/") {
+                    send_photo_reply(ctx, &data, filename, None, telegram, slack).await;
+                } else {
+                    send_document_reply(ctx, &data, filename, None, telegram, slack).await;
+                }
+            }
             HarnessEvent::Error(e) => {
                 if !tool_lines.is_empty() {
                     if consecutive_count > 0 {
@@ -232,6 +264,62 @@ async fn send_error(
     slack: Option<&dyn ChatPlatform>,
 ) {
     send_reply(ctx, &format!("Error: {}", error), telegram, slack).await;
+}
+
+async fn send_photo_reply(
+    ctx: &ReplyContext,
+    data: &[u8],
+    filename: &str,
+    caption: Option<&str>,
+    telegram: Option<&dyn ChatPlatform>,
+    slack: Option<&dyn ChatPlatform>,
+) {
+    let platform: Option<&dyn ChatPlatform> = match ctx.platform {
+        PlatformType::Telegram => telegram,
+        PlatformType::Slack => slack,
+    };
+    if let Some(p) = platform {
+        if let Err(e) = p
+            .send_photo(
+                data,
+                filename,
+                caption,
+                &ctx.chat_id,
+                ctx.thread_ts.as_deref(),
+            )
+            .await
+        {
+            tracing::error!("Failed to send photo: {}", e);
+        }
+    }
+}
+
+async fn send_document_reply(
+    ctx: &ReplyContext,
+    data: &[u8],
+    filename: &str,
+    caption: Option<&str>,
+    telegram: Option<&dyn ChatPlatform>,
+    slack: Option<&dyn ChatPlatform>,
+) {
+    let platform: Option<&dyn ChatPlatform> = match ctx.platform {
+        PlatformType::Telegram => telegram,
+        PlatformType::Slack => slack,
+    };
+    if let Some(p) = platform {
+        if let Err(e) = p
+            .send_document(
+                data,
+                filename,
+                caption,
+                &ctx.chat_id,
+                ctx.thread_ts.as_deref(),
+            )
+            .await
+        {
+            tracing::error!("Failed to send document: {}", e);
+        }
+    }
 }
 
 /// Split a message into chunks of at most `max_len` characters,
