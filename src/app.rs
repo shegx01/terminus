@@ -7,12 +7,12 @@ use chrono::Utc;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
 use crate::buffer::{OutputBuffer, StreamEvent};
+use crate::chat_adapters::{Attachment, ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
 use crate::command::{CommandBlocklist, ParsedCommand};
 use crate::config::Config;
 use crate::delivery::{split_message, GapInfo, GapPrefixes, PendingBannerAcks};
 use crate::harness::claude::ClaudeHarness;
 use crate::harness::{drive_harness, Harness, HarnessKind};
-use crate::chat_adapters::{Attachment, ChatPlatform, IncomingMessage, PlatformType, ReplyContext};
 use crate::power::types::PowerSignal;
 use crate::session::{self, SessionManager};
 use crate::state_store::{StateStore, StateUpdate};

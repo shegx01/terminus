@@ -258,8 +258,8 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     /// Helper to write a TOML string to a temp file and load it.
     fn load_from_str(toml_str: &str) -> anyhow::Result<Config> {
@@ -316,7 +316,8 @@ patterns = []
 "#;
         let err = load_from_str(toml).unwrap_err();
         assert!(
-            err.to_string().contains("discord.channel_id requires discord.guild_id"),
+            err.to_string()
+                .contains("discord.channel_id requires discord.guild_id"),
             "expected guild_id error, got: {}",
             err
         );
@@ -355,7 +356,10 @@ patterns = []
 "#;
         let config = load_from_str(toml);
         // Should fail because [discord] present but no discord_user_id
-        assert!(config.is_err(), "should fail when discord section present but no user_id");
+        assert!(
+            config.is_err(),
+            "should fail when discord section present but no user_id"
+        );
 
         // user_id present, section missing — discord_enabled returns false
         let toml2 = r#"
@@ -370,6 +374,9 @@ bot_token = "tg-token"
 patterns = []
 "#;
         let config2 = load_from_str(toml2).expect("should load fine without [discord] section");
-        assert!(!config2.discord_enabled(), "discord_enabled should be false without [discord] section");
+        assert!(
+            !config2.discord_enabled(),
+            "discord_enabled should be false without [discord] section"
+        );
     }
 }

@@ -509,7 +509,10 @@ mod tests {
             "last_clean_shutdown": true
         }"#;
         let state: State = serde_json::from_str(json).expect("should deserialize old format");
-        assert!(state.chats.discord.is_empty(), "discord should default to empty vec");
+        assert!(
+            state.chats.discord.is_empty(),
+            "discord should default to empty vec"
+        );
         assert_eq!(state.chats.telegram, vec![100]);
         assert_eq!(state.chats.slack, vec!["C1"]);
     }
