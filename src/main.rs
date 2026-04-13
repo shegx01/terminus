@@ -1,10 +1,10 @@
 mod app;
 mod buffer;
+mod chat_adapters;
 mod command;
 mod config;
 mod delivery;
 mod harness;
-mod chat_adapters;
 mod power;
 mod session;
 mod state_store;
@@ -17,10 +17,10 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 
 use app::App;
-use config::Config;
 use chat_adapters::slack::SlackPlatform;
 use chat_adapters::telegram::TelegramAdapter;
 use chat_adapters::{ChatPlatform, DiscordAdapter, IncomingMessage};
+use config::Config;
 use power::types::PowerSignal;
 use state_store::{StateStore, StateUpdate};
 
@@ -124,8 +124,7 @@ async fn main() -> Result<()> {
 
     let discord: Option<Arc<dyn ChatPlatform>> = if config.discord_enabled() {
         let dc_config = config.discord.clone().unwrap();
-        let dc_user_id =
-            serenity::all::UserId::new(config.auth.discord_user_id.unwrap());
+        let dc_user_id = serenity::all::UserId::new(config.auth.discord_user_id.unwrap());
         let throttle = config.streaming.edit_throttle_ms;
         let adapter = Arc::new(DiscordAdapter::new(dc_config, dc_user_id, throttle)?);
         let adapter_clone = Arc::clone(&adapter);

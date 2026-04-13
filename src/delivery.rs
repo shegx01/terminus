@@ -420,9 +420,7 @@ mod tests {
 
     // ─── GapBanner platform filter tests ───────────────────────────────────
 
-    use crate::chat_adapters::{
-        IncomingMessage, PlatformMessageId, PlatformType,
-    };
+    use crate::chat_adapters::{IncomingMessage, PlatformMessageId, PlatformType};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Minimal mock adapter that tracks send_message call count.

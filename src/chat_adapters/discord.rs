@@ -391,10 +391,7 @@ mod tests {
         // logic by checking the guard condition directly.
         let elapsed = before_edit.elapsed();
         let min_gap = std::time::Duration::from_millis(5000);
-        assert!(
-            elapsed < min_gap,
-            "test ran too slowly for throttle check"
-        );
+        assert!(elapsed < min_gap, "test ran too slowly for throttle check");
 
         // The edit_message method would return Ok(()) due to throttle.
         // We verify the throttle logic in isolation: within the window,
