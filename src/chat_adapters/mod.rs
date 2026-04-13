@@ -1,5 +1,9 @@
+pub mod discord;
 pub mod slack;
 pub mod telegram;
+
+#[allow(unused_imports)]
+pub use discord::DiscordAdapter;
 
 use std::path::PathBuf;
 
