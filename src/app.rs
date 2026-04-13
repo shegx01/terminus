@@ -252,6 +252,7 @@ impl App {
         for &chat_id in &self.active_telegram_chats {
             let _ = self.stream_tx.send(StreamEvent::GapBanner {
                 chat_id: chat_id.to_string(),
+                platform: PlatformType::Telegram,
                 paused_at: last_seen,
                 resumed_at: now,
                 gap: wall_gap,
@@ -262,6 +263,7 @@ impl App {
         for chat_id in &self.active_slack_chats {
             let _ = self.stream_tx.send(StreamEvent::GapBanner {
                 chat_id: chat_id.clone(),
+                platform: PlatformType::Slack,
                 paused_at: last_seen,
                 resumed_at: now,
                 gap: wall_gap,
@@ -272,6 +274,7 @@ impl App {
         for chat_id in &self.active_discord_chats {
             let _ = self.stream_tx.send(StreamEvent::GapBanner {
                 chat_id: chat_id.clone(),
+                platform: PlatformType::Discord,
                 paused_at: last_seen,
                 resumed_at: now,
                 gap: wall_gap,
@@ -306,15 +309,20 @@ impl App {
         );
 
         // 2. Broadcast a GapBanner and wait for delivery ack per chat.
-        let telegram_chats: Vec<i64> = self.active_telegram_chats.iter().copied().collect();
-        let slack_chats: Vec<String> = self.active_slack_chats.iter().cloned().collect();
-        let discord_chats: Vec<String> = self.active_discord_chats.iter().cloned().collect();
-
-        let all_chats: Vec<String> = telegram_chats
+        let all_chats: Vec<(String, PlatformType)> = self
+            .active_telegram_chats
             .iter()
-            .map(|id| id.to_string())
-            .chain(slack_chats.iter().cloned())
-            .chain(discord_chats.iter().cloned())
+            .map(|id| (id.to_string(), PlatformType::Telegram))
+            .chain(
+                self.active_slack_chats
+                    .iter()
+                    .map(|id| (id.clone(), PlatformType::Slack)),
+            )
+            .chain(
+                self.active_discord_chats
+                    .iter()
+                    .map(|id| (id.clone(), PlatformType::Discord)),
+            )
             .collect();
 
         // Register pending acks and broadcast banners.  The lock is held only
@@ -325,7 +333,7 @@ impl App {
         let mut ack_futures = Vec::new();
         {
             let mut pending = self.pending_banner_acks.lock().await;
-            for chat_id in &all_chats {
+            for (chat_id, _) in &all_chats {
                 let (tx, rx) = oneshot::channel::<()>();
                 // If `handle_gap` is invoked a second time while the first is still
                 // awaiting acks, this insert replaces the first oneshot sender.  The
@@ -337,9 +345,10 @@ impl App {
             }
         } // lock released
 
-        for chat_id in &all_chats {
+        for (chat_id, platform) in &all_chats {
             let _ = self.stream_tx.send(StreamEvent::GapBanner {
                 chat_id: chat_id.clone(),
+                platform: *platform,
                 paused_at,
                 resumed_at,
                 gap,
