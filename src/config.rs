@@ -13,6 +13,34 @@ pub struct Config {
     pub streaming: StreamingConfig,
     #[serde(default)]
     pub commands: CommandsConfig,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub power: PowerConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+pub struct PowerConfig {
+    #[serde(default = "power_enabled_default")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub stayawake_on_battery: bool,
+    #[serde(default)]
+    pub state_file: Option<std::path::PathBuf>,
+}
+
+fn power_enabled_default() -> bool {
+    true
+}
+
+impl Default for PowerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: power_enabled_default(),
+            stayawake_on_battery: false,
+            state_file: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

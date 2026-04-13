@@ -2,9 +2,12 @@ mod app;
 mod buffer;
 mod command;
 mod config;
+mod delivery;
 mod harness;
 mod platform;
+mod power;
 mod session;
+mod state_store;
 mod tmux;
 
 use std::sync::Arc;
@@ -18,6 +21,8 @@ use config::Config;
 use platform::slack::SlackPlatform;
 use platform::telegram::TelegramAdapter;
 use platform::{ChatPlatform, IncomingMessage};
+use power::types::PowerSignal;
+use state_store::{StateStore, StateUpdate};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -29,29 +34,60 @@ async fn main() -> Result<()> {
     let config = Config::load(&config_path)?;
     tracing::info!("Config loaded successfully");
 
-    let mut app = App::new(&config)?;
+    // ── Channels ──────────────────────────────────────────────────────────────
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<IncomingMessage>(100);
+    let (state_tx, mut state_rx) = mpsc::channel::<StateUpdate>(64);
+    let (power_tx, mut power_rx) = mpsc::channel::<PowerSignal>(32);
+
+    // ── State store ───────────────────────────────────────────────────────────
+    let config_path_buf = std::path::PathBuf::from(&config_path);
+    let state_path = config
+        .power
+        .state_file
+        .clone()
+        .unwrap_or_else(|| StateStore::resolve_default_path(&config_path_buf));
+    let store = StateStore::load(&state_path)?;
+    tracing::info!("State loaded from {}", state_path.display());
+
+    // ── App ───────────────────────────────────────────────────────────────────
+    let mut app = App::new(&config, store, state_tx.clone())?;
 
     // Startup reconciliation — reconnect surviving sessions
     app.reconcile_startup().await;
 
-    // Channels
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<IncomingMessage>(100);
+    // Emit startup gap banners if last shutdown was unclean with a large gap.
+    app.emit_startup_gap_banners();
 
-    // Conditionally create and start platform adapters
+    // ── Platform adapters ─────────────────────────────────────────────────────
     let telegram: Option<Arc<dyn ChatPlatform>> = if config.telegram_enabled() {
         let tg_config = config.telegram.as_ref().unwrap();
         let tg_user_id = config.auth.telegram_user_id.unwrap();
-        let adapter = Arc::new(TelegramAdapter::new(
-            tg_config.bot_token.clone(),
-            tg_user_id,
-            config.streaming.edit_throttle_ms,
-        ));
-        adapter.start(cmd_tx.clone()).await?;
-        app::spawn_delivery_task(
+        let initial_offset = app.initial_telegram_offset();
+        let adapter = Arc::new(
+            TelegramAdapter::new(
+                tg_config.bot_token.clone(),
+                tg_user_id,
+                config.streaming.edit_throttle_ms,
+            )
+            .with_initial_offset(initial_offset),
+        );
+        // Use start_with_state to persist offset updates.
+        adapter
+            .start_with_state(cmd_tx.clone(), state_tx.clone())
+            .await?;
+        delivery::spawn_delivery_task(
             Arc::clone(&adapter) as Arc<dyn ChatPlatform>,
             app.subscribe_stream(),
+            app.pending_banner_acks_handle(),
+            app.gap_prefix_handle(),
         );
-        tracing::info!("Telegram adapter started (user_id={})", tg_user_id);
+        // Give App a handle to the concrete adapter for pause/resume.
+        app.set_telegram_adapter(Arc::clone(&adapter));
+        tracing::info!(
+            "Telegram adapter started (user_id={}, initial_offset={})",
+            tg_user_id,
+            initial_offset
+        );
         Some(adapter)
     } else {
         tracing::info!("Telegram not configured, skipping");
@@ -75,9 +111,11 @@ async fn main() -> Result<()> {
                 tracing::error!("Slack adapter error: {}", e);
             }
         });
-        app::spawn_delivery_task(
+        delivery::spawn_delivery_task(
             Arc::clone(&adapter) as Arc<dyn ChatPlatform>,
             app.subscribe_stream(),
+            app.pending_banner_acks_handle(),
+            app.gap_prefix_handle(),
         );
         tracing::info!("Slack adapter started (user_id={})", sl_user_id);
         Some(adapter)
@@ -98,7 +136,27 @@ async fn main() -> Result<()> {
     app.set_platforms(telegram, slack);
     drop(cmd_tx); // Drop our copy so channel closes when adapters stop
 
-    // Timers
+    // ── Power subsystem ───────────────────────────────────────────────────────
+    if config.power.enabled {
+        #[cfg(target_os = "macos")]
+        let pm: Arc<dyn power::PowerManager> = Arc::new(power::macos::MacOsPowerManager::new());
+        #[cfg(target_os = "linux")]
+        let pm: Arc<dyn power::PowerManager> = Arc::new(power::linux::LinuxPowerManager::new());
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        let pm: Arc<dyn power::PowerManager> = Arc::new(power::fake::FakePowerManager::new(
+            power::types::LidState::Open,
+            power::types::PowerSource::Ac,
+        ));
+
+        let _supervisor =
+            power::supervisor::spawn_power_supervisor(pm, config.power.stayawake_on_battery, None);
+        let _gap_detector = power::gap_detector::spawn_gap_detector(power_tx.clone());
+        tracing::info!("Power subsystem started");
+    } else {
+        tracing::info!("Power subsystem disabled (power.enabled=false)");
+    }
+
+    // ── Timers ────────────────────────────────────────────────────────────────
     let mut health_interval = tokio::time::interval(Duration::from_secs(5));
     let mut poll_interval =
         tokio::time::interval(Duration::from_millis(config.streaming.poll_interval_ms));
@@ -111,6 +169,20 @@ async fn main() -> Result<()> {
     loop {
         tokio::select! {
             biased;
+
+            // Power signals are highest priority — handle gap before any
+            // queued platform message so we don't process stale messages.
+            Some(signal) = power_rx.recv() => {
+                app.handle_gap(signal).await;
+            }
+
+            // State updates — persist before processing commands so chat
+            // bindings are durable if we crash immediately after.  Delivery
+            // tasks resolve banner-ack oneshots directly via the shared
+            // `pending_banner_acks` map — no ack mpsc needed.
+            Some(update) = state_rx.recv() => {
+                app.apply_state_update(update).await;
+            }
 
             msg = cmd_rx.recv() => {
                 match msg {
@@ -128,6 +200,7 @@ async fn main() -> Result<()> {
 
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("Shutting down...");
+                app.mark_clean_shutdown().await;
                 app.cleanup().await;
                 break;
             }
