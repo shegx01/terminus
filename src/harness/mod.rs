@@ -5,7 +5,6 @@ pub mod gemini;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::buffer::{StreamEvent, StructuredOutputPayload};
@@ -270,7 +269,11 @@ pub async fn drive_harness(
                 got_any_output = true;
                 break;
             }
-            HarnessEvent::StructuredOutput { schema, value, run_id } => {
+            HarnessEvent::StructuredOutput {
+                schema,
+                value,
+                run_id,
+            } => {
                 got_any_output = true;
 
                 // Flush any pending tool lines first.
@@ -343,11 +346,7 @@ pub async fn drive_harness(
                     }
                     Err(_) => {
                         // On failure: leave queue file; retry worker will pick it up.
-                        let pending = hctx
-                            .delivery_queue
-                            .pending_count()
-                            .await
-                            .unwrap_or(1);
+                        let pending = hctx.delivery_queue.pending_count().await.unwrap_or(1);
                         send_reply(
                             ctx,
                             &format!("⏳ queued for retry ({} pending)", pending),

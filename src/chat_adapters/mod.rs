@@ -128,12 +128,19 @@ mod tests {
     /// string).  Changing variant names would break existing queue files.
     #[test]
     fn platform_type_roundtrips_json() {
-        for variant in [PlatformType::Telegram, PlatformType::Slack, PlatformType::Discord] {
+        for variant in [
+            PlatformType::Telegram,
+            PlatformType::Slack,
+            PlatformType::Discord,
+        ] {
             let serialized = serde_json::to_string(&variant)
                 .unwrap_or_else(|e| panic!("Failed to serialize {:?}: {}", variant, e));
-            let deserialized: PlatformType = serde_json::from_str(&serialized)
-                .unwrap_or_else(|e| {
-                    panic!("Failed to deserialize '{}' back to PlatformType: {}", serialized, e)
+            let deserialized: PlatformType =
+                serde_json::from_str(&serialized).unwrap_or_else(|e| {
+                    panic!(
+                        "Failed to deserialize '{}' back to PlatformType: {}",
+                        serialized, e
+                    )
                 });
             assert_eq!(
                 variant, deserialized,

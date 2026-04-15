@@ -5,7 +5,7 @@ pub mod webhook;
 pub mod worker;
 
 pub use queue::{DeliveryJob, DeliveryQueue};
-pub use registry::{SchemaRegistry, WebhookInfo};
+pub use registry::SchemaRegistry;
 #[allow(unused_imports)]
 pub use secret::Secret;
 pub use webhook::WebhookClient;

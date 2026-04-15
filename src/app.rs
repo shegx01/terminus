@@ -12,11 +12,11 @@ use crate::command::{CommandBlocklist, HarnessOptions, ParsedCommand};
 use crate::config::Config;
 use crate::delivery::{split_message, GapInfo, GapPrefixes, PendingBannerAcks};
 use crate::harness::claude::ClaudeHarness;
-use crate::harness::{drive_harness, HarnessContext, Harness, HarnessKind};
+use crate::harness::{drive_harness, Harness, HarnessContext, HarnessKind};
 use crate::power::types::PowerSignal;
 use crate::session::{self, SessionManager};
 use crate::state_store::{StateStore, StateUpdate};
-use crate::structured_output::{DeliveryQueue, SchemaRegistry, WebhookClient, spawn_retry_worker};
+use crate::structured_output::{spawn_retry_worker, DeliveryQueue, SchemaRegistry, WebhookClient};
 use crate::tmux::TmuxClient;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -91,19 +91,16 @@ impl App {
             .unwrap_or_else(|_| ".".to_string());
         // Build structured output infrastructure.
         let schema_registry = Arc::new(SchemaRegistry::from_config(&config.schemas)?);
-        let delivery_queue = Arc::new(
-            DeliveryQueue::new(config.structured_output.queue_dir.clone())?,
-        );
+        let delivery_queue = Arc::new(DeliveryQueue::new(
+            config.structured_output.queue_dir.clone(),
+        )?);
         let webhook_client = Arc::new(WebhookClient::new(config.structured_output.timeout_ms));
         let retry_worker_shutdown = Arc::new(tokio::sync::Notify::new());
 
         let mut harnesses: HashMap<HarnessKind, Box<dyn Harness>> = HashMap::new();
         harnesses.insert(
             HarnessKind::Claude,
-            Box::new(
-                ClaudeHarness::new(cwd)
-                    .with_schema_registry(Arc::clone(&schema_registry)),
-            ),
+            Box::new(ClaudeHarness::new(cwd).with_schema_registry(Arc::clone(&schema_registry))),
         );
         let (stream_tx, _) = broadcast::channel::<StreamEvent>(256);
 

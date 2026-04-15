@@ -256,7 +256,10 @@ async fn handle_stream_event(
             }
             let msg = match &status {
                 WebhookStatusKind::Delivered => {
-                    format!("✅ webhook delivered (schema={}, run_id={})", schema, run_id)
+                    format!(
+                        "✅ webhook delivered (schema={}, run_id={})",
+                        schema, run_id
+                    )
                 }
                 WebhookStatusKind::Abandoned => {
                     format!(
@@ -323,11 +326,7 @@ async fn handle_structured_output_rendered(
     } else {
         // Upload as attachment.
         let now = chrono::Utc::now();
-        let filename = format!(
-            "{}-{}.json",
-            payload.schema,
-            now.format("%Y%m%dT%H%M%SZ")
-        );
+        let filename = format!("{}-{}.json", payload.schema, now.format("%Y%m%dT%H%M%SZ"));
         let json_bytes = pretty.into_bytes();
         let kb = json_bytes.len() as f64 / 1024.0;
 
@@ -351,13 +350,7 @@ async fn handle_structured_output_rendered(
         }
 
         if let Err(e) = platform
-            .send_document(
-                &json_bytes,
-                &filename,
-                None,
-                &chat.chat_id,
-                thread_ts,
-            )
+            .send_document(&json_bytes, &filename, None, &chat.chat_id, thread_ts)
             .await
         {
             tracing::error!("Failed to send structured output attachment: {}", e);
@@ -694,8 +687,7 @@ mod tests {
     #[test]
     fn inline_json_max_bytes_is_3900() {
         assert_eq!(
-            INLINE_JSON_MAX_BYTES,
-            3900,
+            INLINE_JSON_MAX_BYTES, 3900,
             "Spec requires INLINE_JSON_MAX_BYTES = 3900"
         );
     }

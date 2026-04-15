@@ -544,7 +544,8 @@ webhook_secret_env = "TERMINUS_NONEXISTENT_ENV_VAR_XYZ123"
         std::env::remove_var("TERMINUS_NONEXISTENT_ENV_VAR_XYZ123");
         let err = load_from_str(&toml).unwrap_err();
         assert!(
-            err.to_string().contains("TERMINUS_NONEXISTENT_ENV_VAR_XYZ123"),
+            err.to_string()
+                .contains("TERMINUS_NONEXISTENT_ENV_VAR_XYZ123"),
             "Error should cite the env var name, got: {}",
             err
         );

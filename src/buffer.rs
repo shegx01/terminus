@@ -6,11 +6,17 @@ use crate::tmux::TmuxClient;
 pub struct StructuredOutputPayload {
     pub schema: String,
     pub value: serde_json::Value,
+    /// ULID of the run that produced this output.  Not currently read by the
+    /// delivery task (the webhook path carries run_id via `DeliveryJob`), but
+    /// kept in this payload so future tracing/observability work can surface it
+    /// in chat-side rendering spans.
+    #[allow(dead_code)]
     pub run_id: String,
 }
 
 /// Status kind for webhook delivery events emitted by the retry worker.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // `Error` variant is reserved for future per-attempt observability events
 pub enum WebhookStatusKind {
     /// Webhook POST succeeded (2xx response).
     Delivered,

@@ -4,8 +4,8 @@ use std::fmt;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::config::SchemaEntry;
 use super::secret::Secret;
+use crate::config::SchemaEntry;
 
 /// Resolved per-schema information available at runtime.
 ///
@@ -24,17 +24,22 @@ pub struct SchemaInfo {
 }
 
 /// Resolved webhook information needed for a single delivery.
+///
+/// Note: the JSON schema itself is NOT carried here — the wire contract uses
+/// raw body + headers, so consumers derive the schema from their own config.
+/// The schema is passed to the Claude SDK separately via
+/// `SchemaRegistry::schema_value(name)`.
 #[derive(Clone)]
 pub struct WebhookInfo {
     pub webhook_url: String,
     pub hmac_secret: Secret<Vec<u8>>,
-    pub schema_value: Value,
 }
 
 /// Registry of all schemas configured in `terminus.toml`.
 ///
 /// Constructed once at startup; the inner map is immutable at runtime
 /// (config changes require a restart).
+#[derive(Default)]
 pub struct SchemaRegistry {
     schemas: HashMap<String, SchemaInfo>,
 }
@@ -83,10 +88,7 @@ impl SchemaRegistry {
                             name, env_var
                         )
                     })?;
-                    (
-                        Some(url.clone()),
-                        Some(Secret::new(raw.into_bytes())),
-                    )
+                    (Some(url.clone()), Some(Secret::new(raw.into_bytes())))
                 }
                 (Some(_), None) => {
                     anyhow::bail!(
@@ -134,21 +136,12 @@ impl SchemaRegistry {
         Some(WebhookInfo {
             webhook_url: url,
             hmac_secret: secret,
-            schema_value: info.schema_value.clone(),
         })
     }
 
     /// Return true if the schema exists in the registry.
     pub fn contains(&self, name: &str) -> bool {
         self.schemas.contains_key(name)
-    }
-}
-
-impl Default for SchemaRegistry {
-    fn default() -> Self {
-        Self {
-            schemas: HashMap::new(),
-        }
     }
 }
 
@@ -216,10 +209,9 @@ mod tests {
             ),
         );
         let err = SchemaRegistry::from_config(&entries).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("TERMINUS_NONEXISTENT_SECRET_12345")
-        );
+        assert!(err
+            .to_string()
+            .contains("TERMINUS_NONEXISTENT_SECRET_12345"));
     }
 
     #[test]
@@ -256,9 +248,15 @@ mod tests {
         );
         let reg = SchemaRegistry::from_config(&entries).unwrap();
         let debug_str = format!("{:?}", reg);
-        assert!(!debug_str.contains("supersecret"), "Secret bytes should not appear in Debug output");
+        assert!(
+            !debug_str.contains("supersecret"),
+            "Secret bytes should not appear in Debug output"
+        );
         // The debug output should list the schema name but not expose secret bytes
-        assert!(debug_str.contains("todos"), "Schema names should appear in Debug output");
+        assert!(
+            debug_str.contains("todos"),
+            "Schema names should appear in Debug output"
+        );
         std::env::remove_var("TERMINUS_TEST_REGISTRY_DEBUG_SECRET");
     }
 }

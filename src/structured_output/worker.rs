@@ -4,20 +4,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use crate::buffer::{StreamEvent, WebhookStatusKind};
 use super::queue::DeliveryQueue;
 use super::registry::SchemaRegistry;
 use super::webhook::WebhookClient;
+use crate::buffer::{StreamEvent, WebhookStatusKind};
 
 /// Exponential backoff delays in seconds: [1, 2, 4, 8, 16, 32, 60, 60, ...]
 const BACKOFF_SCHEDULE_SECS: &[u64] = &[1, 2, 4, 8, 16, 32, 60];
 
 /// Compute the next backoff delay with ±20% jitter sampled fresh per attempt.
 fn next_backoff(attempt: usize) -> Duration {
-    let base_secs = BACKOFF_SCHEDULE_SECS
-        .get(attempt)
-        .copied()
-        .unwrap_or(60); // cap at 60s
+    let base_secs = BACKOFF_SCHEDULE_SECS.get(attempt).copied().unwrap_or(60); // cap at 60s
 
     // ±20% jitter sampled fresh on each call (per-attempt, not per-job).
     // Use a simple pseudorandom approach based on current time nanos.
@@ -134,7 +131,8 @@ pub fn spawn_retry_worker(
                                 age_hours = age.as_secs() / 3600,
                                 "Retry worker: job exceeded max_retry_age_hours, abandoning"
                             );
-                            if let Err(e) = queue.move_to_dead(path, "max_retry_age_exceeded").await {
+                            if let Err(e) = queue.move_to_dead(path, "max_retry_age_exceeded").await
+                            {
                                 tracing::error!("Failed to move aged job to dead/: {}", e);
                             }
                             let _ = events_tx.send(StreamEvent::WebhookStatus {
@@ -244,10 +242,7 @@ pub fn spawn_retry_worker(
             }
 
             if delivered_count > 0 {
-                tracing::info!(
-                    delivered_count = delivered_count,
-                    "queue.drain_complete"
-                );
+                tracing::info!(delivered_count = delivered_count, "queue.drain_complete");
             }
         }
 
@@ -338,7 +333,7 @@ mod tests {
         let max_retry_age_hours: u64 = 0;
         // The condition guard: if 0 > 0 is false, so no job is ever abandoned.
         assert!(
-            !(max_retry_age_hours > 0),
+            max_retry_age_hours == 0,
             "max_retry_age_hours = 0 should never trigger abandonment"
         );
     }

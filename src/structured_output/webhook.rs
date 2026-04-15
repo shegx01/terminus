@@ -46,8 +46,8 @@ impl WebhookClient {
         job: &DeliveryJob,
         webhook_info: &WebhookInfo,
     ) -> Result<Duration, DeliveryError> {
-        let body = serde_json::to_vec(&job.value)
-            .map_err(|e| DeliveryError::Transport(e.to_string()))?;
+        let body =
+            serde_json::to_vec(&job.value).map_err(|e| DeliveryError::Transport(e.to_string()))?;
 
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -175,7 +175,10 @@ mod tests {
         let body = b"{\"value\": 1}";
         let sig1 = sign(secret, 1000000, body);
         let sig2 = sign(secret, 1000001, body);
-        assert_ne!(sig1, sig2, "Different timestamps must produce different signatures");
+        assert_ne!(
+            sig1, sig2,
+            "Different timestamps must produce different signatures"
+        );
     }
 
     #[test]
@@ -240,7 +243,6 @@ mod integration_tests {
         WebhookInfo {
             webhook_url: format!("{}/webhook", server.uri()),
             hmac_secret: Secret::new(secret.to_vec()),
-            schema_value: serde_json::json!({"type": "object"}),
         }
     }
 
@@ -316,7 +318,11 @@ mod integration_tests {
 
         // Second attempt succeeds.
         let result2 = client.deliver(&job, &info).await;
-        assert!(result2.is_ok(), "Expected Ok on recovery, got: {:?}", result2.err());
+        assert!(
+            result2.is_ok(),
+            "Expected Ok on recovery, got: {:?}",
+            result2.err()
+        );
     }
 
     /// Queue a job, then simulate a process restart by re-opening the same queue
@@ -332,7 +338,10 @@ mod integration_tests {
         let q1 = DeliveryQueue::new(queue_dir.clone()).unwrap();
         let job = make_job("todos");
         let pending_path = q1.enqueue(&job).await.unwrap();
-        assert!(pending_path.exists(), "job must be in pending/ before simulated restart");
+        assert!(
+            pending_path.exists(),
+            "job must be in pending/ before simulated restart"
+        );
 
         // Drop q1 to simulate process exit; job file remains on disk.
         drop(q1);
@@ -443,6 +452,9 @@ mod integration_tests {
 
         // Step 4: remove on success (as harness/mod.rs does).
         q.remove(&pending_path).await.unwrap();
-        assert!(!pending_path.exists(), "job should be removed after successful delivery");
+        assert!(
+            !pending_path.exists(),
+            "job should be removed after successful delivery"
+        );
     }
 }

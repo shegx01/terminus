@@ -34,7 +34,6 @@ pub struct DeliveryJob {
 ///
 /// All `tmp/` → `pending/` renames are atomic (same-device, checked at startup).
 pub struct DeliveryQueue {
-    queue_dir: PathBuf,
     tmp_dir: PathBuf,
     pending_dir: PathBuf,
     dead_dir: PathBuf,
@@ -56,7 +55,10 @@ impl DeliveryQueue {
         std::fs::create_dir_all(&tmp_dir)
             .with_context(|| format!("Failed to create queue tmp dir: {}", tmp_dir.display()))?;
         std::fs::create_dir_all(&pending_dir).with_context(|| {
-            format!("Failed to create queue pending dir: {}", pending_dir.display())
+            format!(
+                "Failed to create queue pending dir: {}",
+                pending_dir.display()
+            )
         })?;
         std::fs::create_dir_all(&dead_dir)
             .with_context(|| format!("Failed to create queue dead dir: {}", dead_dir.display()))?;
@@ -69,9 +71,7 @@ impl DeliveryQueue {
                 .with_context(|| format!("Failed to stat tmp dir: {}", tmp_dir.display()))?
                 .dev();
             let pending_dev = std::fs::metadata(&pending_dir)
-                .with_context(|| {
-                    format!("Failed to stat pending dir: {}", pending_dir.display())
-                })?
+                .with_context(|| format!("Failed to stat pending dir: {}", pending_dir.display()))?
                 .dev();
             if tmp_dev != pending_dev {
                 anyhow::bail!(
@@ -86,7 +86,6 @@ impl DeliveryQueue {
         }
 
         Ok(Self {
-            queue_dir,
             tmp_dir,
             pending_dir,
             dead_dir,
@@ -116,9 +115,9 @@ impl DeliveryQueue {
             .with_context(|| format!("Failed to write job to tmp: {}", tmp_path.display()))?;
 
         // fsync the file to ensure the write is durable before rename.
-        let file = tokio::fs::File::open(&tmp_path)
-            .await
-            .with_context(|| format!("Failed to open tmp file for fsync: {}", tmp_path.display()))?;
+        let file = tokio::fs::File::open(&tmp_path).await.with_context(|| {
+            format!("Failed to open tmp file for fsync: {}", tmp_path.display())
+        })?;
         file.sync_all()
             .await
             .with_context(|| format!("Failed to fsync tmp file: {}", tmp_path.display()))?;
@@ -191,18 +190,18 @@ impl DeliveryQueue {
         // Write reason sidecar first.
         tokio::fs::write(&reason_path, reason.as_bytes())
             .await
-            .with_context(|| format!("Failed to write reason sidecar: {}", reason_path.display()))?;
+            .with_context(|| {
+                format!("Failed to write reason sidecar: {}", reason_path.display())
+            })?;
 
         // Move job to dead/.
-        tokio::fs::rename(path, &dead_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "Failed to move job to dead/: {} → {}",
-                    path.display(),
-                    dead_path.display()
-                )
-            })?;
+        tokio::fs::rename(path, &dead_path).await.with_context(|| {
+            format!(
+                "Failed to move job to dead/: {} → {}",
+                path.display(),
+                dead_path.display()
+            )
+        })?;
 
         Ok(())
     }
@@ -221,11 +220,6 @@ impl DeliveryQueue {
         let job: DeliveryJob = serde_json::from_slice(&bytes)
             .with_context(|| format!("Failed to deserialize job: {}", path.display()))?;
         Ok(job)
-    }
-
-    /// Return the root queue directory.
-    pub fn queue_dir(&self) -> &Path {
-        &self.queue_dir
     }
 }
 
@@ -268,7 +262,10 @@ mod tests {
         let pending_path = q.enqueue(&job).await.unwrap();
 
         assert!(pending_path.exists(), "file should be in pending/");
-        let tmp_path = dir.path().join("tmp").join("01HPPPPPPPPPPPPPPPPPPPPPPP.json");
+        let tmp_path = dir
+            .path()
+            .join("tmp")
+            .join("01HPPPPPPPPPPPPPPPPPPPPPPP.json");
         assert!(
             !tmp_path.exists(),
             "file should NOT be in tmp/ after successful enqueue"
@@ -326,7 +323,10 @@ mod tests {
     async fn remove_deletes_pending_file() {
         let dir = tempdir().unwrap();
         let q = DeliveryQueue::new(dir.path().to_path_buf()).unwrap();
-        let path = q.enqueue(&make_job("01HAAAAAAAAAAAAAAAAAAAAAA1")).await.unwrap();
+        let path = q
+            .enqueue(&make_job("01HAAAAAAAAAAAAAAAAAAAAAA1"))
+            .await
+            .unwrap();
         assert!(path.exists());
         q.remove(&path).await.unwrap();
         assert!(!path.exists());
@@ -336,15 +336,24 @@ mod tests {
     async fn move_to_dead_creates_sidecar_and_removes_from_pending() {
         let dir = tempdir().unwrap();
         let q = DeliveryQueue::new(dir.path().to_path_buf()).unwrap();
-        let path = q.enqueue(&make_job("01HAAAAAAAAAAAAAAAAAAAAAA1")).await.unwrap();
+        let path = q
+            .enqueue(&make_job("01HAAAAAAAAAAAAAAAAAAAAAA1"))
+            .await
+            .unwrap();
         assert!(path.exists());
 
         q.move_to_dead(&path, "schema_removed").await.unwrap();
 
         assert!(!path.exists(), "job should be removed from pending");
-        let dead_path = dir.path().join("dead").join("01HAAAAAAAAAAAAAAAAAAAAAA1.json");
+        let dead_path = dir
+            .path()
+            .join("dead")
+            .join("01HAAAAAAAAAAAAAAAAAAAAAA1.json");
         assert!(dead_path.exists(), "job should be in dead/");
-        let reason_path = dir.path().join("dead").join("01HAAAAAAAAAAAAAAAAAAAAAA1.reason");
+        let reason_path = dir
+            .path()
+            .join("dead")
+            .join("01HAAAAAAAAAAAAAAAAAAAAAA1.reason");
         assert!(reason_path.exists(), "reason sidecar should exist");
         let reason = std::fs::read_to_string(reason_path).unwrap();
         assert_eq!(reason, "schema_removed");

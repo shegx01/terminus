@@ -286,9 +286,7 @@ impl ParsedCommand {
 /// prompt text.
 ///
 /// Example: `"--schema=foo my prompt"` → `(HarnessOptions { schema: Some("foo"), .. }, "my prompt")`
-fn split_prompt_options(
-    input: &str,
-) -> std::result::Result<(HarnessOptions, String), ParseError> {
+fn split_prompt_options(input: &str) -> std::result::Result<(HarnessOptions, String), ParseError> {
     let normalized = normalize_quotes(input);
     let tokens = shell_tokenize(&normalized);
 
@@ -1495,7 +1493,11 @@ mod tests {
         // `: claude --schema=todos extract all TODOs` — one-shot with schema
         let cmd = ParsedCommand::parse(": claude --schema=todos extract all TODOs", ':').unwrap();
         match cmd {
-            ParsedCommand::HarnessPrompt { harness, prompt, options } => {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                prompt,
+                options,
+            } => {
                 assert_eq!(harness, HarnessKind::Claude);
                 assert_eq!(prompt, "extract all TODOs");
                 assert_eq!(options.schema, Some("todos".into()));
@@ -1506,10 +1508,11 @@ mod tests {
 
     #[test]
     fn schema_flag_space_separated_parses() {
-        let cmd =
-            ParsedCommand::parse(": claude --schema todos my prompt", ':').unwrap();
+        let cmd = ParsedCommand::parse(": claude --schema todos my prompt", ':').unwrap();
         match cmd {
-            ParsedCommand::HarnessPrompt { options, prompt, .. } => {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
                 assert_eq!(options.schema, Some("todos".into()));
                 assert_eq!(prompt, "my prompt");
             }
@@ -1533,7 +1536,9 @@ mod tests {
         let cmd =
             ParsedCommand::parse(": claude --schema=todos --model sonnet my prompt", ':').unwrap();
         match cmd {
-            ParsedCommand::HarnessPrompt { options, prompt, .. } => {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
                 assert_eq!(options.schema, Some("todos".into()));
                 assert_eq!(options.model, Some("sonnet".into()));
                 assert_eq!(prompt, "my prompt");
