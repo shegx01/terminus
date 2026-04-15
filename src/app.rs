@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -12,10 +13,11 @@ use crate::command::{CommandBlocklist, HarnessOptions, ParsedCommand};
 use crate::config::Config;
 use crate::delivery::{split_message, GapInfo, GapPrefixes, PendingBannerAcks};
 use crate::harness::claude::ClaudeHarness;
-use crate::harness::{drive_harness, Harness, HarnessKind};
+use crate::harness::{drive_harness, Harness, HarnessContext, HarnessKind};
 use crate::power::types::PowerSignal;
 use crate::session::{self, SessionManager};
 use crate::state_store::{StateStore, StateUpdate};
+use crate::structured_output::{spawn_retry_worker, DeliveryQueue, SchemaRegistry, WebhookClient};
 use crate::tmux::TmuxClient;
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -65,6 +67,18 @@ pub struct App {
     /// applied `MarkDirty` on startup.  Used by `emit_startup_gap_banners`
     /// to check whether the previous run exited cleanly.
     startup_was_clean: bool,
+
+    // ── Structured output ─────────────────────────────────────────────────────
+    schema_registry: Arc<SchemaRegistry>,
+    delivery_queue: Arc<DeliveryQueue>,
+    webhook_client: Arc<WebhookClient>,
+    /// Shutdown notify (async wakeup) for the retry worker.  Notified by
+    /// `mark_clean_shutdown` for immediate wakeup during idle/backoff sleeps.
+    retry_worker_shutdown: Arc<tokio::sync::Notify>,
+    /// Shutdown flag (non-blocking poll) for the retry worker.  Flipped by
+    /// `mark_clean_shutdown` so the worker can check between-jobs and break out
+    /// of an active drain loop without waiting for the next await point.
+    retry_worker_shutdown_flag: Arc<AtomicBool>,
 }
 
 impl App {
@@ -81,8 +95,20 @@ impl App {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string());
+        // Build structured output infrastructure.
+        let schema_registry = Arc::new(SchemaRegistry::from_config(&config.schemas)?);
+        let delivery_queue = Arc::new(DeliveryQueue::new(
+            config.structured_output.queue_dir.clone(),
+        )?);
+        let webhook_client = Arc::new(WebhookClient::new(config.structured_output.timeout_ms));
+        let retry_worker_shutdown = Arc::new(tokio::sync::Notify::new());
+        let retry_worker_shutdown_flag = Arc::new(AtomicBool::new(false));
+
         let mut harnesses: HashMap<HarnessKind, Box<dyn Harness>> = HashMap::new();
-        harnesses.insert(HarnessKind::Claude, Box::new(ClaudeHarness::new(cwd)));
+        harnesses.insert(
+            HarnessKind::Claude,
+            Box::new(ClaudeHarness::new(cwd).with_schema_registry(Arc::clone(&schema_registry))),
+        );
         let (stream_tx, _) = broadcast::channel::<StreamEvent>(256);
 
         // Hydrate active chat sets from persisted state.
@@ -117,12 +143,32 @@ impl App {
             gap_prefix: Arc::new(AsyncMutex::new(HashMap::new())),
             dirty_sent: false,
             startup_was_clean,
+            schema_registry: Arc::clone(&schema_registry),
+            delivery_queue: Arc::clone(&delivery_queue),
+            webhook_client: Arc::clone(&webhook_client),
+            retry_worker_shutdown: Arc::clone(&retry_worker_shutdown),
+            retry_worker_shutdown_flag: Arc::clone(&retry_worker_shutdown_flag),
         };
 
         // Immediately mark state dirty in memory (sets last_clean_shutdown=false).
         // This ensures that a crash before `mark_clean_shutdown()` is called
         // will correctly fire a restart banner on the next boot.
         app.store.apply(StateUpdate::MarkDirty);
+
+        // Spawn the retry worker with the broadcast sender's subscribe handle.
+        // We subscribe once here; the worker holds its own receiver.
+        {
+            let events_tx = app.stream_tx.clone();
+            spawn_retry_worker(
+                Arc::clone(&delivery_queue),
+                Arc::clone(&webhook_client),
+                Arc::clone(&schema_registry),
+                events_tx,
+                Arc::clone(&retry_worker_shutdown),
+                Arc::clone(&retry_worker_shutdown_flag),
+                config.structured_output.max_retry_age_hours,
+            );
+        }
 
         Ok(app)
     }
@@ -169,19 +215,19 @@ impl App {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
-                if name_str.starts_with("termbot-") && name_str.ends_with(".out") {
+                if name_str.starts_with("terminus-") && name_str.ends_with(".out") {
                     tracing::info!("Cleaning stale output file: {}", entry.path().display());
                     let _ = std::fs::remove_file(entry.path());
                 }
                 // Clean stale image temp files from previous runs
-                if name_str.starts_with("termbot-img-") {
+                if name_str.starts_with("terminus-img-") {
                     tracing::info!("Cleaning stale image temp file: {}", entry.path().display());
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
         }
 
-        // Reconnect to surviving tb-* tmux sessions
+        // Reconnect to surviving term-* tmux sessions
         match self.session_mgr.tmux().list_sessions().await {
             Ok(sessions) if !sessions.is_empty() => {
                 tracing::info!(
@@ -438,6 +484,12 @@ impl App {
         } else {
             tracing::info!("Clean shutdown persisted");
         }
+        // Signal the retry worker to stop after completing its current job.
+        // Set the atomic flag FIRST so any next non-blocking poll sees `true`,
+        // then notify so an idle/backoff sleep wakes immediately.
+        self.retry_worker_shutdown_flag
+            .store(true, Ordering::SeqCst);
+        self.retry_worker_shutdown.notify_one();
     }
 
     /// Consume and return the inline gap prefix for `chat_id` if one is
@@ -772,6 +824,7 @@ impl App {
             ParsedCommand::HarnessPrompt {
                 harness: kind,
                 ref prompt,
+                ref options,
             } => {
                 if self.blocklist.is_blocked(prompt) {
                     cleanup_attachments(&msg.attachments).await;
@@ -781,14 +834,13 @@ impl App {
                     )
                     .await;
                 } else {
-                    // One-shot prompt (`: claude <prompt>`) — use default options
-                    let opts = HarnessOptions::default();
+                    // One-shot prompt (`: claude --schema=foo <prompt>`): use parsed options.
                     self.send_harness_prompt(
                         &msg.reply_context,
                         &kind,
                         prompt,
                         &msg.attachments,
-                        &opts,
+                        options,
                     )
                     .await;
                 }
@@ -925,14 +977,17 @@ impl App {
             .await
         {
             Ok(event_rx) => {
-                let (got_output, session_id) = drive_harness(
-                    event_rx,
+                let hctx = HarnessContext {
                     ctx,
-                    self.telegram.as_deref(),
-                    self.slack.as_deref(),
-                    self.discord.as_deref(),
-                )
-                .await;
+                    telegram: self.telegram.as_deref(),
+                    slack: self.slack.as_deref(),
+                    discord: self.discord.as_deref(),
+                    schema_registry: &self.schema_registry,
+                    delivery_queue: &self.delivery_queue,
+                    webhook_client: &self.webhook_client,
+                    stream_tx: &self.stream_tx,
+                };
+                let (got_output, session_id) = drive_harness(event_rx, &hctx).await;
                 if let Some(sid) = session_id {
                     harness.set_session_id(&session_name, sid);
                 }
@@ -985,8 +1040,8 @@ mod tests {
     use tempfile::tempdir;
 
     fn make_test_config(dir: &std::path::Path) -> Config {
-        // Write a minimal valid termbot.toml to the temp dir.
-        let toml_path = dir.join("termbot.toml");
+        // Write a minimal valid terminus.toml to the temp dir.
+        let toml_path = dir.join("terminus.toml");
         std::fs::write(
             &toml_path,
             r#"
@@ -1006,7 +1061,7 @@ patterns = []
 
     fn make_app(dir: &std::path::Path) -> (App, mpsc::Receiver<StateUpdate>) {
         let config = make_test_config(dir);
-        let state_path = dir.join("termbot-state.json");
+        let state_path = dir.join("terminus-state.json");
         let store = StateStore::load(&state_path).expect("load state");
         let (state_tx, state_rx) = mpsc::channel::<StateUpdate>(64);
         let app = App::new(&config, store, state_tx).expect("App::new");
@@ -1040,7 +1095,7 @@ patterns = []
         // After persist, counter resets to 0.
         assert_eq!(app.updates_since_persist, 0);
         // State file should exist.
-        assert!(dir.path().join("termbot-state.json").exists());
+        assert!(dir.path().join("terminus-state.json").exists());
     }
 
     #[tokio::test]
@@ -1053,7 +1108,7 @@ patterns = []
         app.mark_clean_shutdown().await;
 
         // Reload from disk and check.
-        let reloaded = StateStore::load(dir.path().join("termbot-state.json")).unwrap();
+        let reloaded = StateStore::load(dir.path().join("terminus-state.json")).unwrap();
         assert!(
             reloaded.snapshot().last_clean_shutdown,
             "mark_clean_shutdown should persist last_clean_shutdown=true"
@@ -1084,7 +1139,7 @@ patterns = []
             "last_seen_wall": old_time.to_rfc3339(),
             "last_clean_shutdown": false
         });
-        let state_path = dir.path().join("termbot-state.json");
+        let state_path = dir.path().join("terminus-state.json");
         std::fs::write(&state_path, state.to_string()).unwrap();
 
         let config = make_test_config(dir.path());
@@ -1124,10 +1179,10 @@ patterns = []
             "last_seen_wall": old_time.to_rfc3339(),
             "last_clean_shutdown": true
         });
-        std::fs::write(dir.path().join("termbot-state.json"), state.to_string()).unwrap();
+        std::fs::write(dir.path().join("terminus-state.json"), state.to_string()).unwrap();
 
         let config = make_test_config(dir.path());
-        let store = StateStore::load(dir.path().join("termbot-state.json")).unwrap();
+        let store = StateStore::load(dir.path().join("terminus-state.json")).unwrap();
         let (state_tx, _state_rx) = mpsc::channel::<StateUpdate>(64);
         let mut app = App::new(&config, store, state_tx).unwrap();
 
@@ -1152,10 +1207,10 @@ patterns = []
             "last_seen_wall": recent.to_rfc3339(),
             "last_clean_shutdown": false
         });
-        std::fs::write(dir.path().join("termbot-state.json"), state.to_string()).unwrap();
+        std::fs::write(dir.path().join("terminus-state.json"), state.to_string()).unwrap();
 
         let config = make_test_config(dir.path());
-        let store = StateStore::load(dir.path().join("termbot-state.json")).unwrap();
+        let store = StateStore::load(dir.path().join("terminus-state.json")).unwrap();
         let (state_tx, _state_rx) = mpsc::channel::<StateUpdate>(64);
         let mut app = App::new(&config, store, state_tx).unwrap();
 

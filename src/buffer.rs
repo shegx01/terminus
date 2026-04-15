@@ -1,4 +1,30 @@
+use crate::chat_adapters::ChatBinding;
 use crate::tmux::TmuxClient;
+
+/// Payload for a structured output result — schema name, validated value, run ID.
+#[derive(Debug, Clone)]
+pub struct StructuredOutputPayload {
+    pub schema: String,
+    pub value: serde_json::Value,
+    /// ULID of the run that produced this output.  Not currently read by the
+    /// delivery task (the webhook path carries run_id via `DeliveryJob`), but
+    /// kept in this payload so future tracing/observability work can surface it
+    /// in chat-side rendering spans.
+    #[allow(dead_code)]
+    pub run_id: String,
+}
+
+/// Status kind for webhook delivery events emitted by the retry worker.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // `Error` variant is reserved for future per-attempt observability events
+pub enum WebhookStatusKind {
+    /// Webhook POST succeeded (2xx response).
+    Delivered,
+    /// Job exceeded `max_retry_age_hours` and was moved to `dead/`.
+    Abandoned,
+    /// An error occurred during delivery (surfaced for observability).
+    Error { msg: String },
+}
 
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
@@ -25,6 +51,33 @@ pub enum StreamEvent {
         resumed_at: chrono::DateTime<chrono::Utc>,
         gap: std::time::Duration,
         missed_count: u32,
+    },
+    /// Emitted when a structured output result is ready for chat-side rendering.
+    ///
+    /// The delivery task handles hybrid rendering (inline code block ≤ 3900 B,
+    /// attachment otherwise).  Carries a `ChatBinding` so the delivery task
+    /// can route without the session-keyed HashMap lookup.
+    StructuredOutputRendered {
+        payload: StructuredOutputPayload,
+        chat: ChatBinding,
+    },
+    /// Emitted by the retry worker when a queued job is delivered, abandoned,
+    /// or encounters a persistent error.
+    ///
+    /// Uses `ChatBinding` for routing (bypasses the session-keyed lookup used
+    /// for streaming terminal output).
+    WebhookStatus {
+        schema: String,
+        run_id: String,
+        status: WebhookStatusKind,
+        chat: ChatBinding,
+    },
+    /// Emitted by the retry worker once per chat after a non-empty drain cycle
+    /// completes.  One event per unique `ChatBinding` whose pending jobs were
+    /// delivered in this cycle.  Chat message: `✅ queue drained (N delivered)`.
+    QueueDrained {
+        delivered_count: u32,
+        chat: ChatBinding,
     },
 }
 
@@ -489,7 +542,7 @@ mod tests {
     #[test]
     fn noise_detection_starship_prompt() {
         assert!(is_noise_line(
-            "termbot on  main ()   [?] is 📦 v0.1.0 via 🦀 v1.76.0",
+            "terminus on  main ()   [?] is 📦 v0.1.0 via 🦀 v1.76.0",
             None
         ));
     }
@@ -550,7 +603,7 @@ mod tests {
     // -------------------------------------------------------------------------
 
     fn make_buf() -> OutputBuffer {
-        OutputBuffer::new("tb-test", 65536)
+        OutputBuffer::new("term-test", 65536)
     }
 
     /// AC-1: Fresh session — `: pwd` delivers the command's output to chat.
