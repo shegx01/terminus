@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # terminus installer — install, upgrade, or uninstall terminus
-# https://github.com/shegx01/termbot
+# https://github.com/shegx01/terminus
 #
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/shegx01/termbot/main/install.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/shegx01/terminus/main/install.sh | bash
 #   bash install.sh [--quick] [--upgrade] [--uninstall] [--no-migrate] [--dry-run]
 #
 # The entire script is wrapped in main() so that a partial download via
@@ -15,7 +15,7 @@ set -euo pipefail
 # Constants
 # =============================================================================
 
-REPO="shegx01/termbot"
+REPO="shegx01/terminus"
 GITHUB_RELEASES="https://api.github.com/repos/${REPO}/releases/latest"
 BINARY_NAME="terminus"
 INSTALL_DIR="${HOME}/.local/bin"
@@ -1114,7 +1114,7 @@ set -euo pipefail
 CONFIG_DIR="${HOME}/.config/terminus"
 VERSION_FILE="${CONFIG_DIR}/.installed-version"
 LOG_DIR="${CONFIG_DIR}/logs"
-REPO="shegx01/termbot"
+REPO="shegx01/terminus"
 API="https://api.github.com/repos/${REPO}/releases/latest"
 
 mkdir -p "$LOG_DIR"

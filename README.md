@@ -13,7 +13,7 @@ terminus gives you remote access to terminal sessions and Claude Code from your 
 The installer downloads the binary, walks you through configuration, installs dependencies, and sets up a system service with auto-restart and update notifications.
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/shegx01/termbot/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/shegx01/terminus/main/install.sh | bash
 ```
 
 That's it. Open Telegram, Slack, or Discord and start typing.
@@ -37,21 +37,21 @@ That's it. Open Telegram, Slack, or Discord and start typing.
 
 ```bash
 # Upgrade
-curl -sSL https://raw.githubusercontent.com/shegx01/termbot/main/install.sh | bash -s -- --upgrade
+curl -sSL https://raw.githubusercontent.com/shegx01/terminus/main/install.sh | bash -s -- --upgrade
 
 # Uninstall
-curl -sSL https://raw.githubusercontent.com/shegx01/termbot/main/install.sh | bash -s -- --uninstall
+curl -sSL https://raw.githubusercontent.com/shegx01/terminus/main/install.sh | bash -s -- --uninstall
 ```
 </details>
 
 ### Download a pre-built binary
 
-Pre-built binaries are also available directly on the [Releases](https://github.com/shegx01/termbot/releases/latest) page if you prefer manual setup.
+Pre-built binaries are also available directly on the [Releases](https://github.com/shegx01/terminus/releases/latest) page if you prefer manual setup.
 
 ```bash
 # Download for your platform (macOS Apple Silicon shown)
 curl -L -o terminus \
-  https://github.com/shegx01/termbot/releases/latest/download/terminus-aarch64-apple-darwin
+  https://github.com/shegx01/terminus/releases/latest/download/terminus-aarch64-apple-darwin
 
 chmod +x terminus
 cp terminus.example.toml terminus.toml   # edit with your tokens
@@ -61,8 +61,8 @@ cp terminus.example.toml terminus.toml   # edit with your tokens
 ### Build from source
 
 ```bash
-git clone https://github.com/shegx01/termbot.git
-cd termbot
+git clone https://github.com/shegx01/terminus.git
+cd terminus
 cp terminus.example.toml terminus.toml   # edit with your tokens
 cargo build --release
 ./target/release/terminus
