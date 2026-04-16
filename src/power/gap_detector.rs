@@ -1,6 +1,16 @@
 //! OS-agnostic sleep-gap detection via wall/monotonic clock divergence.
 //! Per AD-3: ticks every 1s, compares SystemTime vs Instant deltas,
 //! emits PowerSignal::GapDetected when the difference exceeds the threshold.
+//!
+//! # Known limitation — NTP step-forward false positives
+//!
+//! A large NTP step-forward (>30s) advances the wall clock without a
+//! corresponding monotonic advance and will trigger a spurious
+//! `PowerSignal::GapDetected`.  This is an accepted v1 trade-off: NTP steps
+//! of this magnitude are rare on stable hosts and the resulting gap banner is
+//! harmless (users see a restart-style banner rather than missing output).
+//! A future revision could suppress the signal when the monotonic delta is
+//! below `TICK_INTERVAL * 2` (indicating the host was never actually asleep).
 
 use std::time::{Duration, Instant, SystemTime};
 
@@ -22,7 +32,10 @@ pub(crate) fn detect_gap(
     now_wall: SystemTime,
 ) -> Option<(SystemTime, SystemTime, Duration)> {
     let mono_delta = now_mono.duration_since(last_mono);
-    let wall_delta = now_wall.duration_since(last_wall).unwrap_or(Duration::ZERO);
+    let wall_delta = now_wall.duration_since(last_wall).unwrap_or_else(|e| {
+        tracing::debug!(backwards_by = ?e.duration(), "wall clock went backwards (NTP step?)");
+        Duration::ZERO
+    });
 
     if wall_delta > mono_delta + GAP_THRESHOLD {
         let gap = wall_delta - mono_delta;

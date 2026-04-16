@@ -211,7 +211,11 @@ pub async fn drive_harness(
                     last_tool_name = None;
                 }
                 if !text.is_empty() {
-                    for chunk in split_message(&text, 4000) {
+                    let max_len = match ctx.platform {
+                        crate::chat_adapters::PlatformType::Discord => 1900,
+                        _ => 4000,
+                    };
+                    for chunk in split_message(&text, max_len) {
                         send_reply(ctx, &chunk, telegram, slack, discord).await;
                     }
                 }
@@ -331,10 +335,34 @@ pub async fn drive_harness(
                 };
 
                 // Step 4: Sync attempt.
+                // Rename to `.delivering.json` before attempting delivery so the
+                // retry worker (which only scans `*.json`) cannot pick up the same
+                // file concurrently and cause a duplicate POST.
+                let delivering_path = match hctx.delivery_queue.mark_delivering(&queue_path).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to mark job as delivering (will be retried by worker): {}",
+                            e
+                        );
+                        // Leave the file in pending/; the retry worker will deliver it.
+                        let pending = hctx.delivery_queue.pending_count().await.unwrap_or(1);
+                        send_reply(
+                            ctx,
+                            &format!("⏳ queued for retry ({} pending)", pending),
+                            telegram,
+                            slack,
+                            discord,
+                        )
+                        .await;
+                        continue;
+                    }
+                };
+
                 match hctx.webhook_client.deliver(&job, &webhook_info).await {
                     Ok(elapsed) => {
-                        // On success: remove queue file (no retry needed).
-                        let _ = hctx.delivery_queue.remove(&queue_path).await;
+                        // On success: remove the delivering file (no retry needed).
+                        let _ = tokio::fs::remove_file(&delivering_path).await;
                         send_reply(
                             ctx,
                             &format!("✅ delivered to webhook ({}ms)", elapsed.as_millis()),
@@ -345,7 +373,17 @@ pub async fn drive_harness(
                         .await;
                     }
                     Err(_) => {
-                        // On failure: leave queue file; retry worker will pick it up.
+                        // On failure: rename back to `.json` so retry worker picks it up.
+                        if let Err(e) = hctx
+                            .delivery_queue
+                            .unmark_delivering(&delivering_path)
+                            .await
+                        {
+                            tracing::error!(
+                                "Failed to unmark delivering job (manual recovery may be needed): {}",
+                                e
+                            );
+                        }
                         let pending = hctx.delivery_queue.pending_count().await.unwrap_or(1);
                         send_reply(
                             ctx,
@@ -371,6 +409,11 @@ async fn send_reply(
     slack: Option<&dyn ChatPlatform>,
     discord: Option<&dyn ChatPlatform>,
 ) {
+    // Socket-origin: route to the per-request response channel.
+    if let Some(ref tx) = ctx.socket_reply_tx {
+        let _ = tx.send(text.to_string());
+        return;
+    }
     use crate::chat_adapters::PlatformType;
     let platform: Option<&dyn ChatPlatform> = match ctx.platform {
         PlatformType::Telegram => telegram,
@@ -406,6 +449,11 @@ async fn send_photo_reply(
     slack: Option<&dyn ChatPlatform>,
     discord: Option<&dyn ChatPlatform>,
 ) {
+    // Socket-origin: send a text fallback since the socket channel is text-only.
+    if let Some(ref tx) = ctx.socket_reply_tx {
+        let _ = tx.send(format!("[file: {}]", filename));
+        return;
+    }
     let platform: Option<&dyn ChatPlatform> = match ctx.platform {
         PlatformType::Telegram => telegram,
         PlatformType::Slack => slack,
@@ -436,6 +484,11 @@ async fn send_document_reply(
     slack: Option<&dyn ChatPlatform>,
     discord: Option<&dyn ChatPlatform>,
 ) {
+    // Socket-origin: send a text fallback since the socket channel is text-only.
+    if let Some(ref tx) = ctx.socket_reply_tx {
+        let _ = tx.send(format!("[file: {}]", filename));
+        return;
+    }
     let platform: Option<&dyn ChatPlatform> = match ctx.platform {
         PlatformType::Telegram => telegram,
         PlatformType::Slack => slack,

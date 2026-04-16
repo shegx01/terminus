@@ -85,6 +85,7 @@ impl SocketServer {
     /// or on bind failure.
     pub async fn run(self) -> Result<()> {
         let addr = format!("{}:{}", self.config.bind, self.config.port);
+        let bind_addr = &self.config.bind;
         let listener = match TcpListener::bind(&addr).await {
             Ok(l) => {
                 tracing::info!("Socket server listening on ws://{}", addr);
@@ -99,6 +100,14 @@ impl SocketServer {
                 return Ok(());
             }
         };
+
+        if bind_addr != "127.0.0.1" && bind_addr != "::1" && bind_addr != "localhost" {
+            tracing::warn!(
+                bind = %bind_addr,
+                "socket server binding to non-loopback address — Bearer tokens will be \
+                 transmitted in plaintext unless a TLS-terminating reverse proxy is in front"
+            );
+        }
 
         let active_connections = Arc::new(AtomicUsize::new(0));
         let shared_rate_limiters: SharedRateLimiters =
@@ -123,8 +132,11 @@ impl SocketServer {
                         }
                     };
 
-                    // Connection limit check
-                    if active_connections.load(Ordering::Relaxed) >= max_connections {
+                    // Connection limit check: fetch_add before spawn to close the TOCTOU
+                    // window between the check and the increment.
+                    let prev = active_connections.fetch_add(1, Ordering::AcqRel);
+                    if prev >= max_connections {
+                        active_connections.fetch_sub(1, Ordering::Release);
                         tracing::warn!(
                             peer = %peer_addr,
                             "Socket connection rejected: max_connections ({}) reached",
@@ -145,6 +157,7 @@ impl SocketServer {
                     let cancel_tx = self.cancel_tx.clone();
                     // Snapshot the current client list atomically for this connection's auth
                     let clients_snapshot = self.shared_clients.load_full();
+                    let shared_clients_live = Arc::clone(&self.shared_clients);
                     let shared_subs = Arc::clone(&self.shared_subs);
 
                     tokio::spawn(async move {
@@ -206,6 +219,7 @@ impl SocketServer {
                             Ok(ws) => ws,
                             Err(e) => {
                                 tracing::debug!(peer = %peer_addr, error = %e, "WebSocket upgrade failed");
+                                active.fetch_sub(1, Ordering::Release);
                                 return;
                             }
                         };
@@ -213,7 +227,6 @@ impl SocketServer {
                         let client_name = authenticated_client.unwrap_or_else(|| "unknown".into());
                         let session_id = ulid::Ulid::new().to_string();
 
-                        active.fetch_add(1, Ordering::Relaxed);
                         tracing::info!(
                             client = %client_name,
                             session = %session_id,
@@ -233,10 +246,11 @@ impl SocketServer {
                             rate_limiters,
                             cancel_tx,
                             shared_subs,
+                            shared_clients_live,
                         )
                         .await;
 
-                        active.fetch_sub(1, Ordering::Relaxed);
+                        active.fetch_sub(1, Ordering::Release);
                         tracing::info!(
                             client = %client_name,
                             session = %session_id,
@@ -250,14 +264,18 @@ impl SocketServer {
 }
 
 /// Constant-time byte comparison to prevent timing side-channel attacks
-/// on token authentication. Uses XOR accumulation so the comparison time
-/// is independent of the position of the first differing byte.
+/// on token authentication. Always iterates over `max(a.len(), b.len())`
+/// bytes, padding the shorter input with zeros, so the loop count is
+/// determined by the longer input. Length mismatch is XOR-folded into the
+/// accumulator.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+    let len_diff = (a.len() != b.len()) as u8;
+    let max_len = std::cmp::max(a.len(), b.len());
+    let mut acc = len_diff;
+    for i in 0..max_len {
+        let x = if i < a.len() { a[i] } else { 0 };
+        let y = if i < b.len() { b[i] } else { 0 };
+        acc |= x ^ y;
     }
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
+    acc == 0
 }
