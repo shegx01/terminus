@@ -19,15 +19,13 @@ use tokio::sync::mpsc;
 /// Claude Code SDK harness with multi-turn session support.
 pub struct ClaudeHarness {
     sessions: Mutex<HashMap<String, String>>, // session_name -> claude session_id
-    cwd: PathBuf,
     schema_registry: Arc<SchemaRegistry>,
 }
 
 impl ClaudeHarness {
-    pub fn new(cwd: String) -> Self {
+    pub fn new() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            cwd: PathBuf::from(cwd),
             schema_registry: Arc::new(SchemaRegistry::default()),
         }
     }
@@ -53,7 +51,7 @@ impl Harness for ClaudeHarness {
         &self,
         prompt: &str,
         attachments: &[Attachment],
-        _cwd: &Path,
+        cwd: &Path,
         session_id: Option<&str>,
         options: &HarnessOptions,
     ) -> Result<mpsc::Receiver<HarnessEvent>> {
@@ -62,7 +60,7 @@ impl Harness for ClaudeHarness {
         // Build the enhanced prompt with @ mentions for image attachments
         let full_prompt = build_image_prompt(prompt, attachments);
 
-        let cwd = self.cwd.clone();
+        let cwd = cwd.to_path_buf();
         let resume_session = session_id.map(|s| s.to_string());
         let attachment_paths: Vec<PathBuf> = attachments.iter().map(|a| a.path.clone()).collect();
         let harness_opts = options.clone();

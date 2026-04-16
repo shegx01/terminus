@@ -133,9 +133,23 @@ Uses `tmux capture-pane -S -` (full scrollback) with line-offset tracking. Each 
 
 ### Claude Code integration
 
-Uses `claude-agent-sdk-rust` crate, not terminal scraping. Claude prompts spawn via `tokio::spawn` with an mpsc event channel. Multi-turn sessions are tracked by session name -> Claude session ID in `ClaudeManager`. Two modes:
+Uses `claude-agent-sdk-rust` crate, not terminal scraping. Claude prompts spawn via `tokio::spawn` with an mpsc event channel. Multi-turn sessions are tracked by session name -> Claude session ID in `ClaudeHarness`. Two modes:
 - One-shot: `: claude <prompt>`
 - Interactive: `: claude on` / `: claude off` toggles plain text routing
+
+**Named sessions:** Users can explicitly name and resume Claude conversation sessions using CLI flags:
+- `--name <name>` / `-n <name>` — **create-or-resume** (upsert). If the session exists, resumes it with a notification. If not, creates a new one.
+- `--resume <name>` / `--continue <name>` — **strict resume**. Errors if the session doesn't exist. Catches typos and LRU-evicted sessions.
+- Session names follow the same rules as terminal session names (alphanumeric, hyphens, underscores, max 64 chars).
+- Both flags work in one-shot (`: claude --name auth fix bug`) and interactive (`: claude on --name auth`) modes.
+- `--name` and `--resume` are mutually exclusive.
+- Only works with harnesses that support resume (currently Claude only).
+
+**Session persistence:** Named sessions persist across restarts. The session index (name -> session_id + working directory) is stored in `terminus-state.json` via StateStore. The Claude SDK persists conversation state in `.claude/`. On resume, the stored working directory is passed to the SDK.
+
+**LRU eviction:** Named sessions are capped at `max_named_sessions` (default 50, configurable in `[harness]` section of `terminus.toml`). When the cap is reached, the least-recently-used session is evicted.
+
+**Breaking change:** The `-n` short flag was reassigned from `--max-turns` to `--name`. Use `-t` for `--max-turns` instead.
 
 ### Platform adapters
 

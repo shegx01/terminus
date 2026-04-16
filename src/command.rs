@@ -36,6 +36,10 @@ pub struct HarnessOptions {
     pub permission_mode: Option<String>,
     /// Schema name for structured output (registered in terminus.toml).
     pub schema: Option<String>,
+    /// Named session for multi-turn resume (--name / -n).
+    pub name: Option<String>,
+    /// Strict resume of a named session (--resume / --continue).
+    pub resume: Option<String>,
 }
 
 impl HarnessOptions {
@@ -51,6 +55,8 @@ impl HarnessOptions {
             && self.mcp_config.is_none()
             && self.permission_mode.is_none()
             && self.schema.is_none()
+            && self.name.is_none()
+            && self.resume.is_none()
     }
 
     /// Build a human-readable summary of active options for the ON confirmation message.
@@ -89,6 +95,12 @@ impl HarnessOptions {
         }
         if let Some(ref s) = self.schema {
             parts.push(format!("schema={}", s));
+        }
+        if let Some(ref n) = self.name {
+            parts.push(format!("name={}", n));
+        }
+        if let Some(ref r) = self.resume {
+            parts.push(format!("resume={}", r));
         }
         parts.join(", ")
     }
@@ -328,6 +340,34 @@ fn split_prompt_options(input: &str) -> std::result::Result<(HarnessOptions, Str
     Ok((options, prompt))
 }
 
+/// Validate a session name used in harness `--name` / `--resume` flags.
+/// Same rules as `validate_session_name` (alphanumeric, hyphens, underscores,
+/// max 64 chars) but returns `ParseError::InvalidHarnessOption` with the
+/// originating flag name for context.
+fn validate_harness_session_name(name: &str, flag: &str) -> std::result::Result<(), ParseError> {
+    if name.is_empty() {
+        return Err(ParseError::InvalidHarnessOption(format!(
+            "{} requires a non-empty session name",
+            flag
+        )));
+    }
+    if name.chars().count() > MAX_SESSION_NAME_LEN {
+        return Err(ParseError::InvalidHarnessOption(format!(
+            "Session name too long (max {} characters)",
+            MAX_SESSION_NAME_LEN
+        )));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ParseError::InvalidHarnessOption(
+            "Session name can only contain letters, numbers, hyphens, and underscores".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Parse CLI-style options from the text after `on `.
 ///
 /// Supported flags:
@@ -403,7 +443,7 @@ fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, Par
                 let val = get_value!();
                 opts.add_dirs.push(PathBuf::from(val));
             }
-            "--max-turns" | "-n" => {
+            "--max-turns" | "-t" => {
                 let val = get_value!();
                 let n: u32 = val.parse().map_err(|_| {
                     ParseError::InvalidHarnessOption(format!(
@@ -444,6 +484,16 @@ fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, Par
                 let val = get_value!();
                 opts.schema = Some(val);
             }
+            "--name" | "-n" => {
+                let val = get_value!();
+                validate_harness_session_name(&val, flag)?;
+                opts.name = Some(val);
+            }
+            "--resume" | "--continue" => {
+                let val = get_value!();
+                validate_harness_session_name(&val, flag)?;
+                opts.resume = Some(val);
+            }
             other => {
                 // Better error for short-flag=value syntax (e.g. `-m=opus`)
                 if other.starts_with('-') && other.contains('=') {
@@ -454,7 +504,7 @@ fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, Par
                     )));
                 }
                 return Err(ParseError::InvalidHarnessOption(format!(
-                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config, --permission-mode, --schema",
+                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config, --permission-mode, --schema, --name, --resume/--continue",
                     other
                 )));
             }
@@ -466,6 +516,11 @@ fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, Par
     if opts.system_prompt.is_some() && opts.append_system_prompt.is_some() {
         return Err(ParseError::InvalidHarnessOption(
             "Cannot use both --system-prompt and --append-system-prompt".to_string(),
+        ));
+    }
+    if opts.name.is_some() && opts.resume.is_some() {
+        return Err(ParseError::InvalidHarnessOption(
+            "Cannot use both --name and --resume/--continue".to_string(),
         ));
     }
 
@@ -1178,7 +1233,7 @@ mod tests {
 
     #[test]
     fn parse_claude_on_with_max_turns() {
-        let cmd = ParsedCommand::parse(": claude on -n 5", ':').unwrap();
+        let cmd = ParsedCommand::parse(": claude on -t 5", ':').unwrap();
         assert_eq!(
             cmd,
             ParsedCommand::HarnessOn {
@@ -1217,7 +1272,7 @@ mod tests {
     #[test]
     fn parse_claude_on_with_multiple_options() {
         let cmd = ParsedCommand::parse(
-            ": claude on --model sonnet --effort high --add-dir ../lib -n 10",
+            ": claude on --model sonnet --effort high --add-dir ../lib -t 10",
             ':',
         )
         .unwrap();
@@ -1664,5 +1719,181 @@ mod tests {
         // Chained safe commands must not be blocked
         assert!(!bl.is_blocked("echo hello ; ls -la"));
         assert!(!bl.is_blocked("echo hello && ls -la"));
+    }
+
+    // ── Named session flag tests ───────────────────────────────────────────
+
+    #[test]
+    fn parse_name_flag_long() {
+        let cmd = ParsedCommand::parse(": claude --name auth fix bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.name, Some("auth".into()));
+                assert_eq!(prompt, "fix bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_name_flag_short() {
+        let cmd = ParsedCommand::parse(": claude -n auth fix bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.name, Some("auth".into()));
+                assert_eq!(prompt, "fix bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_name_flag_equals() {
+        let cmd = ParsedCommand::parse(": claude --name=auth fix bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.name, Some("auth".into()));
+                assert_eq!(prompt, "fix bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_resume_flag() {
+        let cmd = ParsedCommand::parse(": claude --resume auth fix bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.resume, Some("auth".into()));
+                assert_eq!(prompt, "fix bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_continue_flag() {
+        let cmd = ParsedCommand::parse(": claude --continue auth fix bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.resume, Some("auth".into()));
+                assert_eq!(prompt, "fix bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_name_on_mode() {
+        let cmd = ParsedCommand::parse(": claude on --name auth", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn { options, .. } => {
+                assert_eq!(options.name, Some("auth".into()));
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_resume_on_mode() {
+        let cmd = ParsedCommand::parse(": claude on --resume auth", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn { options, .. } => {
+                assert_eq!(options.resume, Some("auth".into()));
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_name_and_resume_rejected() {
+        let err = ParsedCommand::parse(": claude --name auth --resume auth fix", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("Cannot use both"));
+    }
+
+    #[test]
+    fn parse_name_invalid_session_name() {
+        let err = ParsedCommand::parse(": claude --name foo:bar fix", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+    }
+
+    #[test]
+    fn parse_max_turns_short_flag_changed() {
+        let cmd = ParsedCommand::parse(": claude on -t 5", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    max_turns: Some(5),
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn parse_name_short_equals_rejected() {
+        let err = ParsedCommand::parse(": claude -n=auth fix", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("long flags"));
+    }
+
+    #[test]
+    fn parse_name_missing_value() {
+        let err = ParsedCommand::parse(": claude --name", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("requires a value"));
+    }
+
+    #[test]
+    fn parse_resume_missing_value() {
+        let err = ParsedCommand::parse(": claude --resume", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("requires a value"));
+    }
+
+    #[test]
+    fn parse_name_with_other_options() {
+        let cmd = ParsedCommand::parse(": claude --name auth --model sonnet fix bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.name, Some("auth".into()));
+                assert_eq!(options.model, Some("sonnet".into()));
+                assert_eq!(prompt, "fix bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn harness_options_summary_includes_name() {
+        let opts = HarnessOptions {
+            name: Some("auth".into()),
+            ..Default::default()
+        };
+        assert_eq!(opts.summary(), "name=auth");
+    }
+
+    #[test]
+    fn harness_options_is_empty_false_when_name_set() {
+        let opts = HarnessOptions {
+            name: Some("auth".into()),
+            ..Default::default()
+        };
+        assert!(!opts.is_empty());
     }
 }

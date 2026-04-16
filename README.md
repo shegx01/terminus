@@ -112,7 +112,7 @@ Show me the test gaps.           # still the same session
 ```
 : claude on --model sonnet --effort high
 : claude on --add-dir ../shared-lib
-: claude on -m opus -n 10 --add-dir ../api
+: claude on -m opus -t 10 --add-dir ../api
 ```
 
 **Image support** -- send photos to Claude directly from chat:
@@ -394,7 +394,9 @@ Options passed to `: claude on` persist for the entire session (until `: claude 
 | `--system-prompt <text>` | | Replace the default system prompt |
 | `--append-system-prompt <text>` | | Append to the default system prompt |
 | `--add-dir <path>` | `-d` | Add a directory for context (repeatable) |
-| `--max-turns <n>` | `-n` | Limit agentic turns per prompt |
+| `--max-turns <n>` | `-t` | Limit agentic turns per prompt |
+| `--name <name>` | `-n` | Name a Claude session for multi-turn resume (create-or-resume) |
+| `--resume <name>` / `--continue <name>` | | Strict resume of a named session (error if not found) |
 | `--settings <path>` | | Path to a Claude Code settings file or inline JSON |
 | `--mcp-config <path>` | | Path to an MCP server config file |
 | `--permission-mode <mode>` | `-p` | Permission mode: `default`, `acceptEdits`, `plan`, `bypassPermissions` (default: `bypassPermissions`) |
@@ -408,7 +410,9 @@ Examples:
 ```
 : claude on --model sonnet                          # use Sonnet model
 : claude on --effort high --add-dir ../shared-lib   # deeper thinking + extra context
-: claude on -m opus -n 10                           # Opus model, max 10 turns per prompt
+: claude on -m opus -t 10                           # Opus model, max 10 turns per prompt
+: claude on -n auth                                 # interactive mode with named session "auth"
+: claude --resume auth fix the login bug            # strict resume of session "auth"
 : claude on --system-prompt "Focus on security"     # custom system prompt
 : claude on --mcp-config ./mcp.json --settings ./s.json
 : claude on -p acceptEdits                              # Claude can edit files but not run shell commands
@@ -459,6 +463,39 @@ To check what Claude (or any program) is doing in a tmux session, use `: screen`
 This captures exactly what you'd see if you were looking at the terminal -- useful when Claude is working on a long task and you want a progress check.
 
 Use tmux mode when you need Claude Code's full interactive features (slash commands, permission prompts, multi-file editing workflows). Use SDK mode when you want quick, clean answers with image support.
+
+### Named sessions
+
+By default, Claude conversation context is tied to the foreground terminal session name. Named sessions decouple this — you can create, name, and resume Claude conversations independently.
+
+**Create or resume a named session (`--name` / `-n`):**
+
+```
+: claude --name auth-refactor explain the auth middleware     # creates "auth-refactor"
+: claude --name auth-refactor now fix the JWT validation      # resumes "auth-refactor" (notifies you)
+: claude on --name auth-refactor                              # interactive mode with "auth-refactor"
+```
+
+If the session already exists, `--name` resumes it and shows a notification. If it doesn't exist, it creates a new one.
+
+**Strict resume (`--resume` / `--continue`):**
+
+```
+: claude --resume auth-refactor add rate limiting             # resumes, errors if not found
+: claude --resume typo                                        # → "No session named 'typo'"
+```
+
+Use `--resume` when you know the session exists and want to catch typos. `--continue` is an alias for `--resume`.
+
+**How it works:**
+- Named sessions persist across restarts — the session index (name → session ID + working directory) is saved in `terminus-state.json`
+- The Claude SDK stores conversation history in `.claude/` — terminus only tracks the mapping
+- On resume, the stored working directory is passed to the SDK for context
+- Sessions are LRU-evicted when the index exceeds `max_named_sessions` (default 50, configurable in `[harness]` section)
+- `--name` and `--resume` are mutually exclusive
+- Only works with harnesses that support resume (currently Claude)
+
+**Breaking change:** `-n` was previously the short flag for `--max-turns`. It now means `--name`. Use `-t` for `--max-turns`.
 
 ---
 

@@ -27,6 +27,9 @@ pub struct Config {
     /// WebSocket socket server config (`[socket]` table).
     #[serde(default)]
     pub socket: SocketConfig,
+    /// Harness session management config (`[harness]` table).
+    #[serde(default)]
+    pub harness: HarnessConfig,
 }
 
 // ─── Socket configuration ────────────────────────────────────────────────────
@@ -202,6 +205,13 @@ fn default_queue_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("~/.local/share"))
         .join("terminus")
         .join("queue")
+}
+
+/// Configuration for harness session management.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct HarnessConfig {
+    /// Maximum named harness sessions before LRU eviction (default: 50).
+    pub max_named_sessions: Option<usize>,
 }
 
 impl Default for StructuredOutputConfig {
