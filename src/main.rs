@@ -184,10 +184,12 @@ async fn main() -> Result<()> {
         arc_swap::ArcSwap::from_pointee(config.socket.clients.clone()),
     );
 
-    // Spawn config watcher if socket is enabled
+    // Spawn config watcher if socket is enabled.
+    // Pass the canonicalized path so the kqueue watcher opens the file
+    // directly rather than resolving a relative path to CWD.
     let _config_watcher_handle = if config.socket_enabled() {
         socket::config_watcher::spawn_config_watcher(
-            std::path::PathBuf::from(&config_path),
+            config_path_buf.clone(),
             Arc::clone(&shared_clients),
         )
     } else {

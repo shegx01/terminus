@@ -116,7 +116,10 @@ impl PowerManager for MacOsPowerManager {
         match run_ioreg_clamshell().await {
             Ok(output) => parse_clamshell_output(&output),
             Err(e) => {
-                debug!(err = %e, "ioreg lid query failed; returning Absent");
+                debug!(
+                    err = format!("{:#}", e),
+                    "ioreg lid query failed; returning Absent"
+                );
                 LidState::Absent
             }
         }
@@ -126,7 +129,10 @@ impl PowerManager for MacOsPowerManager {
         match run_pmset_batt().await {
             Ok(output) => parse_power_source_output(&output),
             Err(e) => {
-                debug!(err = %e, "pmset power query failed; returning Unknown");
+                debug!(
+                    err = format!("{:#}", e),
+                    "pmset power query failed; returning Unknown"
+                );
                 PowerSource::Unknown
             }
         }
