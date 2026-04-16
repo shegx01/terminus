@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::Utc;
+use futures_util::future::join_all;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
 use crate::buffer::{OutputBuffer, StreamEvent};
@@ -159,10 +160,11 @@ impl App {
             retry_worker_shutdown_flag: Arc::clone(&retry_worker_shutdown_flag),
         };
 
-        // Immediately mark state dirty in memory (sets last_clean_shutdown=false).
-        // This ensures that a crash before `mark_clean_shutdown()` is called
-        // will correctly fire a restart banner on the next boot.
+        // Immediately mark state dirty in memory (sets last_clean_shutdown=false)
+        // and force-persist to disk so a crash within the first ~5s (before the
+        // debounce window fires) still triggers a restart banner on the next boot.
         app.store.apply(StateUpdate::MarkDirty);
+        app.store.persist()?;
 
         // Spawn the retry worker with the broadcast sender's subscribe handle.
         // We subscribe once here; the worker holds its own receiver.
@@ -453,8 +455,16 @@ impl App {
             });
         }
 
-        for (chat_id, rx) in ack_futures {
-            match tokio::time::timeout(Duration::from_secs(5), rx).await {
+        // Await all banner acks concurrently (5s timeout each) so a slow
+        // delivery task on one platform does not delay others.
+        let results = join_all(ack_futures.into_iter().map(|(chat_id, rx)| async move {
+            let result = tokio::time::timeout(Duration::from_secs(5), rx).await;
+            (chat_id, result)
+        }))
+        .await;
+
+        for (chat_id, result) in results {
+            match result {
                 Ok(Ok(())) => {
                     tracing::info!(
                         "GapBanner delivered for chat_id={} (gap={:.0}s)",
@@ -513,9 +523,13 @@ impl App {
             }
             _ => {}
         }
+        // Safety-critical variants bypass the debounce window so a crash
+        // immediately after cannot leave the on-disk state inconsistent.
+        let force = matches!(&update, StateUpdate::MarkDirty | StateUpdate::SetCleanShutdown(_));
         self.store.apply(update);
         self.updates_since_persist += 1;
-        if self.updates_since_persist >= 10
+        if force
+            || self.updates_since_persist >= 10
             || self.last_state_persist.elapsed() >= Duration::from_secs(5)
         {
             if let Err(e) = self.store.persist() {
@@ -554,7 +568,9 @@ impl App {
     pub async fn handle_command(&mut self, msg: &IncomingMessage) {
         // Ensure MarkDirty is sent on the first real user interaction.
         if !self.dirty_sent {
-            let _ = self.state_tx.try_send(StateUpdate::MarkDirty);
+            if let Err(e) = self.state_tx.try_send(StateUpdate::MarkDirty) {
+                tracing::warn!("state_tx full, update dropped: {}", e);
+            }
             self.dirty_sent = true;
         }
 
@@ -576,20 +592,26 @@ impl App {
                 PlatformType::Telegram => {
                     if let Ok(id) = msg.reply_context.chat_id.parse::<i64>() {
                         if self.active_telegram_chats.insert(id) {
-                            let _ = self.state_tx.try_send(StateUpdate::BindTelegramChat(id));
+                            if let Err(e) = self.state_tx.try_send(StateUpdate::BindTelegramChat(id)) {
+                                tracing::warn!("state_tx full, update dropped: {}", e);
+                            }
                         }
                     }
                 }
                 PlatformType::Slack => {
                     let id = msg.reply_context.chat_id.clone();
                     if self.active_slack_chats.insert(id.clone()) {
-                        let _ = self.state_tx.try_send(StateUpdate::BindSlackChat(id));
+                        if let Err(e) = self.state_tx.try_send(StateUpdate::BindSlackChat(id)) {
+                            tracing::warn!("state_tx full, update dropped: {}", e);
+                        }
                     }
                 }
                 PlatformType::Discord => {
                     let id = msg.reply_context.chat_id.clone();
                     if self.active_discord_chats.insert(id.clone()) {
-                        let _ = self.state_tx.try_send(StateUpdate::BindDiscordChat(id));
+                        if let Err(e) = self.state_tx.try_send(StateUpdate::BindDiscordChat(id)) {
+                            tracing::warn!("state_tx full, update dropped: {}", e);
+                        }
                     }
                 }
             }
@@ -1014,7 +1036,9 @@ impl App {
             });
         }
         // Emit a Tick to keep last_seen_wall fresh for restart-gap computation.
-        let _ = self.state_tx.try_send(StateUpdate::Tick);
+        if let Err(e) = self.state_tx.try_send(StateUpdate::Tick) {
+            tracing::warn!("state_tx full, update dropped: {}", e);
+        }
     }
 
     pub async fn poll_output(&mut self) {

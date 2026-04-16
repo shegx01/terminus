@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
 
     // ── Channels ──────────────────────────────────────────────────────────────
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<IncomingMessage>(100);
-    let (state_tx, mut state_rx) = mpsc::channel::<StateUpdate>(64);
+    let (state_tx, mut state_rx) = mpsc::channel::<StateUpdate>(256);
     let (power_tx, mut power_rx) = mpsc::channel::<PowerSignal>(32);
     let (cancel_tx, mut cancel_rx) = mpsc::channel::<String>(32);
 
@@ -69,9 +69,6 @@ async fn main() -> Result<()> {
 
     // Startup reconciliation — reconnect surviving sessions
     app.reconcile_startup().await;
-
-    // Emit startup gap banners if last shutdown was unclean with a large gap.
-    app.emit_startup_gap_banners();
 
     // ── Platform adapters ─────────────────────────────────────────────────────
     let telegram: Option<Arc<dyn ChatPlatform>> = if config.telegram_enabled() {
@@ -173,6 +170,10 @@ async fn main() -> Result<()> {
     .collect();
 
     app.set_platforms(telegram, slack, discord);
+
+    // Emit startup gap banners AFTER all delivery tasks are spawned and
+    // subscribed to the stream channel — otherwise banners are lost.
+    app.emit_startup_gap_banners();
 
     // ── Socket server (optional) ─────────────────────────────────────────────
     let socket_cancel = tokio_util::sync::CancellationToken::new();
