@@ -22,31 +22,26 @@ pub type SharedClientList = Arc<ArcSwap<Vec<SocketClient>>>;
 ///
 /// Only `[[socket.client]]` entries are reloaded. Changes to bind, port,
 /// max_connections, etc. are logged as warnings (require restart).
+///
+/// Watches the config FILE directly (not its parent directory) to avoid
+/// the kqueue backend opening FDs for every sibling entry.  After an
+/// editor atomic-save (rename), the kqueue watch is lost; we re-establish
+/// it after each reload so subsequent edits are still detected.
 pub fn spawn_config_watcher(
     config_path: PathBuf,
     shared_clients: SharedClientList,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let (fs_tx, mut fs_rx) = mpsc::channel::<()>(4);
 
-    // Set up filesystem watcher — filter by config filename to avoid
-    // spurious reloads from sibling file changes in the same directory.
-    let watch_path = config_path.clone();
-    let config_filename = watch_path
-        .file_name()
-        .map(|f| f.to_os_string())
-        .unwrap_or_default();
     let mut watcher = match RecommendedWatcher::new(
         move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
-                if event.kind.is_modify() || event.kind.is_create() {
-                    // Only trigger for our config file, not sibling files
-                    let matches = event
-                        .paths
-                        .iter()
-                        .any(|p| p.file_name().map(|f| f == config_filename).unwrap_or(false));
-                    if matches {
-                        let _ = fs_tx.try_send(());
-                    }
+                // Any vnode event on the config file (modify, rename, delete)
+                // triggers a reload attempt.
+                let dominated =
+                    event.kind.is_modify() || event.kind.is_create() || event.kind.is_remove();
+                if dominated {
+                    let _ = fs_tx.try_send(());
                 }
             }
         },
@@ -62,19 +57,21 @@ pub fn spawn_config_watcher(
         }
     };
 
-    // Watch the parent directory (handles atomic rename/replace by editors)
-    let watch_dir = watch_path.parent().unwrap_or(watch_path.as_ref());
-    if let Err(e) = watcher.watch(watch_dir.as_ref(), RecursiveMode::NonRecursive) {
+    // Watch the config file directly — avoids kqueue opening FDs for every
+    // entry in the parent directory (which caused FD exhaustion when the
+    // parent was the project root containing target/, .git/, etc.).
+    if let Err(e) = watcher.watch(&config_path, RecursiveMode::NonRecursive) {
         tracing::warn!(
-            "Failed to watch config directory: {} — hot-reload disabled",
+            "Failed to watch config file {}: {} — hot-reload disabled",
+            config_path.display(),
             e
         );
         return None;
     }
 
     let handle = tokio::spawn(async move {
-        // Keep watcher alive for the lifetime of this task
-        let _watcher = watcher;
+        // Watcher must stay alive; it is also mutated to re-watch after renames.
+        let mut watcher = watcher;
 
         while fs_rx.recv().await.is_some() {
             // Debounce: sleep 500ms to collect rapid-fire events (editor
@@ -87,6 +84,23 @@ pub fn spawn_config_watcher(
             while fs_rx.try_recv().is_ok() {}
 
             tracing::info!("Config file changed, attempting hot-reload of socket clients...");
+
+            // Re-watch BEFORE reload so the new inode is tracked while we
+            // parse.  Any edit arriving during reload queues another event
+            // for the next iteration (absorbed by the debounce).
+            if let Err(e) = watcher.unwatch(&config_path) {
+                tracing::debug!(
+                    "unwatch before re-watch returned error (expected after rename): {}",
+                    e
+                );
+            }
+            if let Err(e) = watcher.watch(&config_path, RecursiveMode::NonRecursive) {
+                tracing::warn!(
+                    "Failed to re-watch config file: {} — \
+                     subsequent config changes may not be detected until restart",
+                    e
+                );
+            }
 
             match Config::load(&config_path) {
                 Ok(new_config) => {
