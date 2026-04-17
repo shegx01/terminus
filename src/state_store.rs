@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -8,6 +9,14 @@ use serde::{Deserialize, Serialize};
 // State types
 // ──────────────────────────────────────────────────────────────────────────────
 
+/// A named harness session entry persisted to disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NamedSessionEntry {
+    pub session_id: String,
+    pub cwd: PathBuf,
+    pub last_used: DateTime<Utc>,
+}
+
 /// Persisted state schema.  schema_version == 1 for this implementation.
 /// Any file with a different schema_version is treated as corrupt/incompatible
 /// and quarantined so a fresh default is used instead.
@@ -17,6 +26,8 @@ pub struct State {
     pub telegram: TelegramState,
     pub chats: Chats,
     pub last_seen_wall: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub harness_sessions: HashMap<String, NamedSessionEntry>,
     pub last_clean_shutdown: bool,
 }
 
@@ -27,6 +38,7 @@ impl Default for State {
             telegram: TelegramState::default(),
             chats: Chats::default(),
             last_seen_wall: None,
+            harness_sessions: HashMap::new(),
             last_clean_shutdown: true,
         }
     }
@@ -74,6 +86,9 @@ pub enum StateUpdate {
     /// Explicitly set last_clean_shutdown to the given value.
     /// Used by `App::mark_clean_shutdown()` on graceful shutdown.
     SetCleanShutdown(bool),
+    /// Batch upsert/remove named harness session entries.
+    /// Vec allows atomic eviction + insert in a single update.
+    HarnessSessionBatch(Vec<(String, Option<NamedSessionEntry>)>),
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -186,6 +201,18 @@ impl StateStore {
             }
             StateUpdate::SetCleanShutdown(val) => {
                 self.state.last_clean_shutdown = val;
+            }
+            StateUpdate::HarnessSessionBatch(ops) => {
+                for (name, entry) in ops {
+                    match entry {
+                        Some(e) => {
+                            self.state.harness_sessions.insert(name, e);
+                        }
+                        None => {
+                            self.state.harness_sessions.remove(&name);
+                        }
+                    }
+                }
             }
         }
     }
@@ -556,5 +583,107 @@ mod tests {
 
         // State must be default (schema_version = 1).
         assert_eq!(store.snapshot().schema_version, 1);
+    }
+
+    #[test]
+    fn harness_session_batch_upsert() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminus-state.json");
+        let mut store = StateStore::load(&path).unwrap();
+
+        let entry = super::NamedSessionEntry {
+            session_id: "sid-123".into(),
+            cwd: PathBuf::from("/tmp/project"),
+            last_used: chrono::Utc::now(),
+        };
+
+        store.apply(StateUpdate::HarnessSessionBatch(vec![(
+            "auth".into(),
+            Some(entry.clone()),
+        )]));
+
+        assert_eq!(store.snapshot().harness_sessions.len(), 1);
+        assert_eq!(
+            store.snapshot().harness_sessions["auth"].session_id,
+            "sid-123"
+        );
+    }
+
+    #[test]
+    fn harness_session_batch_remove() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminus-state.json");
+        let mut store = StateStore::load(&path).unwrap();
+
+        let entry = super::NamedSessionEntry {
+            session_id: "sid-123".into(),
+            cwd: PathBuf::from("/tmp/project"),
+            last_used: chrono::Utc::now(),
+        };
+
+        store.apply(StateUpdate::HarnessSessionBatch(vec![(
+            "auth".into(),
+            Some(entry),
+        )]));
+        assert_eq!(store.snapshot().harness_sessions.len(), 1);
+
+        store.apply(StateUpdate::HarnessSessionBatch(vec![(
+            "auth".into(),
+            None,
+        )]));
+        assert!(store.snapshot().harness_sessions.is_empty());
+    }
+
+    #[test]
+    fn harness_session_batch_atomic_evict_and_insert() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("terminus-state.json");
+        let mut store = StateStore::load(&path).unwrap();
+
+        let old_entry = super::NamedSessionEntry {
+            session_id: "old-sid".into(),
+            cwd: PathBuf::from("/tmp/old"),
+            last_used: chrono::Utc::now(),
+        };
+        let new_entry = super::NamedSessionEntry {
+            session_id: "new-sid".into(),
+            cwd: PathBuf::from("/tmp/new"),
+            last_used: chrono::Utc::now(),
+        };
+
+        // Insert old
+        store.apply(StateUpdate::HarnessSessionBatch(vec![(
+            "old".into(),
+            Some(old_entry),
+        )]));
+
+        // Atomic evict old + insert new
+        store.apply(StateUpdate::HarnessSessionBatch(vec![
+            ("old".into(), None),
+            ("new".into(), Some(new_entry)),
+        ]));
+
+        assert_eq!(store.snapshot().harness_sessions.len(), 1);
+        assert!(!store.snapshot().harness_sessions.contains_key("old"));
+        assert_eq!(
+            store.snapshot().harness_sessions["new"].session_id,
+            "new-sid"
+        );
+    }
+
+    #[test]
+    fn backward_compat_deserialize_without_harness_sessions() {
+        let json = r#"{
+            "schema_version": 1,
+            "telegram": { "offset": 0 },
+            "chats": { "telegram": [], "slack": [] },
+            "last_seen_wall": null,
+            "last_clean_shutdown": true
+        }"#;
+        let state: State = serde_json::from_str(json).expect("should deserialize old format");
+        assert!(
+            state.harness_sessions.is_empty(),
+            "harness_sessions should default to empty map"
+        );
     }
 }

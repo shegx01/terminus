@@ -19,6 +19,11 @@ pub struct SessionState {
     pub created_at: Instant,
     pub active_harness: Option<HarnessKind>,
     pub harness_options: HarnessOptions,
+    /// Tracks the currently-resolved named session in interactive mode.
+    /// Set when `HarnessOn` resolves a `--name`/`--resume` flag; used to
+    /// suppress repeat "resuming session" notifications on subsequent
+    /// `StdinInput` prompts.  Reset to `None` on `HarnessOff`.
+    pub named_session_resolved: Option<String>,
 }
 
 pub struct SessionManager {
@@ -76,6 +81,7 @@ impl SessionManager {
                 created_at: Instant::now(),
                 active_harness: None,
                 harness_options: HarnessOptions::default(),
+                named_session_resolved: None,
             },
         );
         if is_first {
@@ -119,6 +125,7 @@ impl SessionManager {
                 created_at: Instant::now(),
                 active_harness: None,
                 harness_options: HarnessOptions::default(),
+                named_session_resolved: None,
             },
         );
         self.foreground = Some(name.to_string());
@@ -192,7 +199,8 @@ impl SessionManager {
     }
 
     /// Set the active harness and options for a named session.
-    /// When `harness` is `None` (harness off), options are cleared.
+    /// When `harness` is `None` (harness off), options and
+    /// `named_session_resolved` are cleared.
     pub fn set_harness(
         &mut self,
         session_name: &str,
@@ -201,11 +209,29 @@ impl SessionManager {
     ) {
         if let Some(session) = self.sessions.get_mut(session_name) {
             session.active_harness = harness;
-            session.harness_options = if harness.is_some() {
-                options
+            if harness.is_some() {
+                session.harness_options = options;
             } else {
-                HarnessOptions::default()
-            };
+                session.harness_options = HarnessOptions::default();
+                session.named_session_resolved = None;
+            }
+        }
+    }
+
+    /// Get the currently-resolved named session for the foreground session.
+    pub fn foreground_named_session_resolved(&self) -> Option<&str> {
+        self.foreground
+            .as_ref()
+            .and_then(|name| self.sessions.get(name))
+            .and_then(|s| s.named_session_resolved.as_deref())
+    }
+
+    /// Set the resolved named session for the foreground session.
+    pub fn set_named_session_resolved(&mut self, resolved: Option<String>) {
+        if let Some(ref fg) = self.foreground {
+            if let Some(session) = self.sessions.get_mut(fg) {
+                session.named_session_resolved = resolved;
+            }
         }
     }
 
@@ -280,5 +306,24 @@ impl SessionManager {
         );
         self.sessions.clear();
         self.foreground = None;
+    }
+
+    /// Test-only: register a foreground session without spawning tmux.
+    /// Use from unit tests that exercise `handle_command` paths requiring
+    /// a foreground session.
+    #[cfg(test)]
+    pub fn install_test_foreground(&mut self, name: &str) {
+        self.sessions.insert(
+            name.to_string(),
+            SessionState {
+                name: name.to_string(),
+                status: SessionStatus::Foreground,
+                created_at: tokio::time::Instant::now(),
+                active_harness: None,
+                harness_options: HarnessOptions::default(),
+                named_session_resolved: None,
+            },
+        );
+        self.foreground = Some(name.to_string());
     }
 }

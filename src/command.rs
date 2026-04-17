@@ -36,6 +36,10 @@ pub struct HarnessOptions {
     pub permission_mode: Option<String>,
     /// Schema name for structured output (registered in terminus.toml).
     pub schema: Option<String>,
+    /// Named session for multi-turn resume (--name / -n).
+    pub name: Option<String>,
+    /// Strict resume of a named session (--resume / --continue).
+    pub resume: Option<String>,
 }
 
 impl HarnessOptions {
@@ -51,6 +55,8 @@ impl HarnessOptions {
             && self.mcp_config.is_none()
             && self.permission_mode.is_none()
             && self.schema.is_none()
+            && self.name.is_none()
+            && self.resume.is_none()
     }
 
     /// Build a human-readable summary of active options for the ON confirmation message.
@@ -90,6 +96,12 @@ impl HarnessOptions {
         if let Some(ref s) = self.schema {
             parts.push(format!("schema={}", s));
         }
+        if let Some(ref n) = self.name {
+            parts.push(format!("name={}", n));
+        }
+        if let Some(ref r) = self.resume {
+            parts.push(format!("resume={}", r));
+        }
         parts.join(", ")
     }
 }
@@ -116,10 +128,14 @@ pub enum ParsedCommand {
     },
     /// Capture and send the current terminal screen
     Screen,
-    /// Enter interactive harness mode — plain text routes to the harness
+    /// Enter interactive harness mode — plain text routes to the harness.
+    /// If `initial_prompt` is set, the mode is enabled AND the prompt is
+    /// sent as the first message in one go
+    /// (e.g. `: claude on --resume review please look at the bag`).
     HarnessOn {
         harness: HarnessKind,
         options: HarnessOptions,
+        initial_prompt: Option<String>,
     },
     /// Exit interactive harness mode — plain text routes back to tmux
     HarnessOff {
@@ -223,14 +239,39 @@ impl ParsedCommand {
                     return Ok(ParsedCommand::HarnessOn {
                         harness: kind,
                         options: HarnessOptions::default(),
+                        initial_prompt: None,
                     });
                 }
                 // `: claude on --model sonnet --add-dir ../lib`
+                // `: claude on --resume review please look at the bag`
+                //   (flags first, then a prompt — we enable the mode AND
+                //   fire the prompt as the first message.)
+                //
+                // `: claude on <prompt>` (no flags) is rejected: `on` is
+                // a mode toggle, not a one-shot — if the user wants a
+                // quick prompt they should use `: claude <prompt>`. This
+                // also prevents muscle-memory typos like `: claude on hi`
+                // from silently entering interactive mode and burning
+                // a Claude call on a stray word.
                 if let Some(on_args) = after_harness.strip_prefix("on ") {
-                    let options = parse_harness_options(on_args.trim())?;
+                    let trimmed = on_args.trim();
+                    let (options, prompt) = split_prompt_options(trimmed)?;
+                    if options.is_empty() {
+                        return Err(ParseError::InvalidHarnessOption(format!(
+                            "`on` expects flags (e.g. `--name foo`, `--resume bar`). \
+                             For a one-shot prompt use `: claude {}` instead.",
+                            trimmed
+                        )));
+                    }
+                    let initial_prompt = if prompt.is_empty() {
+                        None
+                    } else {
+                        Some(prompt)
+                    };
                     return Ok(ParsedCommand::HarnessOn {
                         harness: kind,
                         options,
+                        initial_prompt,
                     });
                 }
                 if after_harness == "off" {
@@ -321,11 +362,40 @@ fn split_prompt_options(input: &str) -> std::result::Result<(HarnessOptions, Str
         return Ok((HarnessOptions::default(), prompt));
     }
 
-    // Re-join the flag tokens and parse them.
-    let flag_str = flag_tokens.join(" ");
-    let options = parse_harness_options(&flag_str)?;
+    // Parse directly from tokens — re-joining with spaces would lose the
+    // quote context on multi-word values (e.g. `--system-prompt "a b c"`
+    // would become `--system-prompt a b c`).
+    let options = parse_harness_options_tokens(flag_tokens)?;
 
     Ok((options, prompt))
+}
+
+/// Validate a session name used in harness `--name` / `--resume` flags.
+/// Same rules as `validate_session_name` (alphanumeric, hyphens, underscores,
+/// max 64 chars) but returns `ParseError::InvalidHarnessOption` with the
+/// originating flag name for context.
+fn validate_harness_session_name(name: &str, flag: &str) -> std::result::Result<(), ParseError> {
+    if name.is_empty() {
+        return Err(ParseError::InvalidHarnessOption(format!(
+            "{} requires a non-empty session name",
+            flag
+        )));
+    }
+    if name.chars().count() > MAX_SESSION_NAME_LEN {
+        return Err(ParseError::InvalidHarnessOption(format!(
+            "Session name too long (max {} characters)",
+            MAX_SESSION_NAME_LEN
+        )));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ParseError::InvalidHarnessOption(
+            "Session name can only contain letters, numbers, hyphens, and underscores".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Parse CLI-style options from the text after `on `.
@@ -339,11 +409,14 @@ fn split_prompt_options(input: &str) -> std::result::Result<(HarnessOptions, Str
 ///   --max-turns <n>                 Maximum agentic turns per prompt
 ///   --settings <path|json>          Claude Code settings file or inline JSON
 ///   --mcp-config <path>             MCP server config file
-fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, ParseError> {
+/// Parse harness options from a pre-tokenized slice. Callers are expected
+/// to have already run `shell_tokenize` on a `normalize_quotes`-cleaned
+/// input (typically via `split_prompt_options`) so that quoted multi-word
+/// values like `--system-prompt "You are a Rust expert"` survive intact.
+fn parse_harness_options_tokens(
+    tokens: &[String],
+) -> std::result::Result<HarnessOptions, ParseError> {
     let mut opts = HarnessOptions::default();
-    // Normalize smart/curly quotes from mobile keyboards before tokenizing
-    let normalized = normalize_quotes(input);
-    let tokens = shell_tokenize(&normalized);
     let mut i = 0;
 
     while i < tokens.len() {
@@ -403,7 +476,7 @@ fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, Par
                 let val = get_value!();
                 opts.add_dirs.push(PathBuf::from(val));
             }
-            "--max-turns" | "-n" => {
+            "--max-turns" | "-t" => {
                 let val = get_value!();
                 let n: u32 = val.parse().map_err(|_| {
                     ParseError::InvalidHarnessOption(format!(
@@ -444,6 +517,16 @@ fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, Par
                 let val = get_value!();
                 opts.schema = Some(val);
             }
+            "--name" | "-n" => {
+                let val = get_value!();
+                validate_harness_session_name(&val, flag)?;
+                opts.name = Some(val);
+            }
+            "--resume" | "--continue" => {
+                let val = get_value!();
+                validate_harness_session_name(&val, flag)?;
+                opts.resume = Some(val);
+            }
             other => {
                 // Better error for short-flag=value syntax (e.g. `-m=opus`)
                 if other.starts_with('-') && other.contains('=') {
@@ -454,7 +537,7 @@ fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, Par
                     )));
                 }
                 return Err(ParseError::InvalidHarnessOption(format!(
-                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config, --permission-mode, --schema",
+                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config, --permission-mode, --schema, --name, --resume/--continue",
                     other
                 )));
             }
@@ -466,6 +549,11 @@ fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, Par
     if opts.system_prompt.is_some() && opts.append_system_prompt.is_some() {
         return Err(ParseError::InvalidHarnessOption(
             "Cannot use both --system-prompt and --append-system-prompt".to_string(),
+        ));
+    }
+    if opts.name.is_some() && opts.resume.is_some() {
+        return Err(ParseError::InvalidHarnessOption(
+            "Cannot use both --name and --resume/--continue".to_string(),
         ));
     }
 
@@ -871,6 +959,7 @@ mod tests {
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Claude,
                 options: HarnessOptions::default(),
+                initial_prompt: None,
             }
         );
     }
@@ -902,6 +991,7 @@ mod tests {
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Gemini,
                 options: HarnessOptions::default(),
+                initial_prompt: None,
             }
         );
     }
@@ -1104,6 +1194,7 @@ mod tests {
                     model: Some("sonnet".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1119,6 +1210,7 @@ mod tests {
                     model: Some("opus".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1134,6 +1226,7 @@ mod tests {
                     effort: Some("high".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1156,6 +1249,7 @@ mod tests {
                     add_dirs: vec![PathBuf::from("../lib")],
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1172,13 +1266,14 @@ mod tests {
                     add_dirs: vec![PathBuf::from("../lib"), PathBuf::from("../shared")],
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
 
     #[test]
     fn parse_claude_on_with_max_turns() {
-        let cmd = ParsedCommand::parse(": claude on -n 5", ':').unwrap();
+        let cmd = ParsedCommand::parse(": claude on -t 5", ':').unwrap();
         assert_eq!(
             cmd,
             ParsedCommand::HarnessOn {
@@ -1187,6 +1282,7 @@ mod tests {
                     max_turns: Some(5),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1210,6 +1306,7 @@ mod tests {
                     system_prompt: Some("You are a Rust expert".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1217,7 +1314,7 @@ mod tests {
     #[test]
     fn parse_claude_on_with_multiple_options() {
         let cmd = ParsedCommand::parse(
-            ": claude on --model sonnet --effort high --add-dir ../lib -n 10",
+            ": claude on --model sonnet --effort high --add-dir ../lib -t 10",
             ':',
         )
         .unwrap();
@@ -1232,6 +1329,7 @@ mod tests {
                     max_turns: Some(10),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1261,6 +1359,7 @@ mod tests {
                     settings: Some("./settings.json".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1276,6 +1375,7 @@ mod tests {
                     mcp_config: Some(PathBuf::from("./mcp.json")),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1295,6 +1395,7 @@ mod tests {
                     append_system_prompt: Some("Always use TypeScript".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1310,6 +1411,7 @@ mod tests {
                     permission_mode: Some("acceptEdits".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1325,6 +1427,7 @@ mod tests {
                     permission_mode: Some("bypassPermissions".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1424,6 +1527,7 @@ mod tests {
                     model: Some("sonnet".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1440,6 +1544,7 @@ mod tests {
                     effort: Some("high".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1467,6 +1572,7 @@ mod tests {
                     system_prompt: Some("Be concise".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1487,6 +1593,7 @@ mod tests {
                     system_prompt: Some("Be concise".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1664,5 +1771,342 @@ mod tests {
         // Chained safe commands must not be blocked
         assert!(!bl.is_blocked("echo hello ; ls -la"));
         assert!(!bl.is_blocked("echo hello && ls -la"));
+    }
+
+    // ── Named session flag tests ───────────────────────────────────────────
+
+    #[test]
+    fn parse_name_flag_long() {
+        let cmd = ParsedCommand::parse(": claude --name auth fix bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.name, Some("auth".into()));
+                assert_eq!(prompt, "fix bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_name_flag_short() {
+        let cmd = ParsedCommand::parse(": claude -n auth fix bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.name, Some("auth".into()));
+                assert_eq!(prompt, "fix bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_name_flag_equals() {
+        let cmd = ParsedCommand::parse(": claude --name=auth fix bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.name, Some("auth".into()));
+                assert_eq!(prompt, "fix bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_resume_flag() {
+        let cmd = ParsedCommand::parse(": claude --resume auth fix bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.resume, Some("auth".into()));
+                assert_eq!(prompt, "fix bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_continue_flag() {
+        let cmd = ParsedCommand::parse(": claude --continue auth fix bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.resume, Some("auth".into()));
+                assert_eq!(prompt, "fix bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_name_on_mode() {
+        let cmd = ParsedCommand::parse(": claude on --name auth", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn { options, .. } => {
+                assert_eq!(options.name, Some("auth".into()));
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_resume_on_mode() {
+        let cmd = ParsedCommand::parse(": claude on --resume auth", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn { options, .. } => {
+                assert_eq!(options.resume, Some("auth".into()));
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_em_dashed_name_on_mode() {
+        // iOS autocorrect turns `--` into `—`; the normalizer should
+        // fold it back so long flags keep working from mobile chat.
+        let cmd = ParsedCommand::parse(": claude on \u{2014}name auth", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn { options, .. } => {
+                assert_eq!(options.name, Some("auth".into()));
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_em_dashed_resume_one_shot() {
+        let cmd = ParsedCommand::parse(": claude \u{2014}resume auth fix bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.resume, Some("auth".into()));
+                assert_eq!(prompt, "fix bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    // ── HarnessOn with trailing initial prompt ───────────────────────────────
+
+    #[test]
+    fn parse_on_with_resume_and_initial_prompt() {
+        let cmd = ParsedCommand::parse(": claude on --resume review please look at the bag", ':')
+            .unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                options,
+                initial_prompt,
+                ..
+            } => {
+                assert_eq!(options.resume, Some("review".into()));
+                assert_eq!(initial_prompt.as_deref(), Some("please look at the bag"));
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_on_with_em_dashed_resume_and_initial_prompt() {
+        // The full mobile-chat case that triggered the bug report:
+        // iOS autocorrect turns `--resume` into `—resume`, and `on` mode
+        // must accept a trailing prompt.
+        let cmd = ParsedCommand::parse(
+            ": claude on \u{2014}resume review please review the background color of the bag",
+            ':',
+        )
+        .unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                options,
+                initial_prompt,
+                ..
+            } => {
+                assert_eq!(options.resume, Some("review".into()));
+                assert_eq!(
+                    initial_prompt.as_deref(),
+                    Some("please review the background color of the bag")
+                );
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_on_with_continue_alias_no_prompt() {
+        let cmd = ParsedCommand::parse(": claude on --continue review", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                options,
+                initial_prompt,
+                ..
+            } => {
+                assert_eq!(options.resume, Some("review".into()));
+                assert!(initial_prompt.is_none());
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_on_with_name_and_initial_prompt() {
+        let cmd = ParsedCommand::parse(": claude on --name auth fix the login bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                options,
+                initial_prompt,
+                ..
+            } => {
+                assert_eq!(options.name, Some("auth".into()));
+                assert_eq!(initial_prompt.as_deref(), Some("fix the login bug"));
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_on_with_quoted_system_prompt_then_initial_prompt() {
+        // G1: quoted multi-word flag value followed by a prompt. Previously
+        // untested — exercises the token round-trip through
+        // `split_prompt_options` → `parse_harness_options_tokens`.
+        let cmd = ParsedCommand::parse(
+            ": claude on --system-prompt \"You are a Rust expert\" review this",
+            ':',
+        )
+        .unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                options,
+                initial_prompt,
+                ..
+            } => {
+                assert_eq!(
+                    options.system_prompt.as_deref(),
+                    Some("You are a Rust expert")
+                );
+                assert_eq!(initial_prompt.as_deref(), Some("review this"));
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_on_name_and_resume_rejected() {
+        // G2: mutex validation fires for `on` mode as well as one-shot.
+        let err = ParsedCommand::parse(": claude on --name auth --resume auth", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("Cannot use both"));
+    }
+
+    #[test]
+    fn parse_on_without_flags_is_rejected() {
+        // `: claude on <prompt>` without flags is disallowed: `on` is a
+        // mode toggle, not a one-shot, and silently entering interactive
+        // mode on a muscle-memory typo like `: claude on hi` would burn
+        // a Claude call on a stray word. The error tells the user how to
+        // do what they probably meant.
+        let err = ParsedCommand::parse(": claude on hello there", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("on` expects flags"),
+            "error should explain `on` needs flags: {}",
+            msg
+        );
+        assert!(
+            msg.contains(": claude hello there"),
+            "error should suggest the one-shot form: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn parse_name_and_resume_rejected() {
+        let err = ParsedCommand::parse(": claude --name auth --resume auth fix", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("Cannot use both"));
+    }
+
+    #[test]
+    fn parse_name_invalid_session_name() {
+        let err = ParsedCommand::parse(": claude --name foo:bar fix", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+    }
+
+    #[test]
+    fn parse_max_turns_short_flag_changed() {
+        let cmd = ParsedCommand::parse(": claude on -t 5", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessOn {
+                harness: HarnessKind::Claude,
+                options: HarnessOptions {
+                    max_turns: Some(5),
+                    ..Default::default()
+                },
+                initial_prompt: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_name_short_equals_rejected() {
+        let err = ParsedCommand::parse(": claude -n=auth fix", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("long flags"));
+    }
+
+    #[test]
+    fn parse_name_missing_value() {
+        let err = ParsedCommand::parse(": claude --name", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("requires a value"));
+    }
+
+    #[test]
+    fn parse_resume_missing_value() {
+        let err = ParsedCommand::parse(": claude --resume", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        assert!(err.to_string().contains("requires a value"));
+    }
+
+    #[test]
+    fn parse_name_with_other_options() {
+        let cmd = ParsedCommand::parse(": claude --name auth --model sonnet fix bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.name, Some("auth".into()));
+                assert_eq!(options.model, Some("sonnet".into()));
+                assert_eq!(prompt, "fix bug");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn harness_options_summary_includes_name() {
+        let opts = HarnessOptions {
+            name: Some("auth".into()),
+            ..Default::default()
+        };
+        assert_eq!(opts.summary(), "name=auth");
+    }
+
+    #[test]
+    fn harness_options_is_empty_false_when_name_set() {
+        let opts = HarnessOptions {
+            name: Some("auth".into()),
+            ..Default::default()
+        };
+        assert!(!opts.is_empty());
     }
 }

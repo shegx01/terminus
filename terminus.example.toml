@@ -59,6 +59,16 @@ stayawake_on_battery = false
 # state_file = "/absolute/or/~-prefixed/path/to/terminus-state.json"
 
 # ---------------------------------------------------------------------------
+# Named Harness Sessions
+# ---------------------------------------------------------------------------
+# Controls the maximum number of named Claude sessions (--name / --resume)
+# kept in the session index. When the cap is reached, the least-recently-used
+# session is evicted. Default: 50.
+#
+# [harness]
+# max_named_sessions = 50
+
+# ---------------------------------------------------------------------------
 # Structured Output (--schema)
 # ---------------------------------------------------------------------------
 # Named JSON schemas for `: harness --schema <name> <prompt>` commands.

@@ -178,17 +178,49 @@ impl TmuxClient {
     }
 }
 
-/// Normalize Unicode smart/curly quotes into plain ASCII equivalents.
-/// Mobile keyboards (Telegram iOS/Android, Slack) auto-replace straight
-/// quotes with typographic variants that shells don't recognize.
+/// Normalize Unicode typographic characters that mobile keyboards
+/// auto-replace (curly quotes, em-dashes) into plain ASCII equivalents.
+/// Telegram iOS, Slack iOS, and macOS autocorrect all replace straight
+/// quotes and `--` with typographic variants the shell-style parser
+/// doesn't recognize — leaving `—name auth` to be treated as prompt text
+/// instead of a flag.
+///
+/// Em-dash (U+2014) is normalized to `--` **only when it's in flag
+/// position** — i.e. preceded by whitespace or at the start of input,
+/// AND immediately followed by an ASCII letter. This matches the shape
+/// of a long flag (`--name`, `--resume`, …) that iOS autocorrect
+/// converted during typing, while leaving em-dashes used as prose
+/// punctuation (e.g. `fix the bug—urgently` or `hello — world`)
+/// untouched.
+/// En-dash (U+2013) is left alone too: it's rarely an autocorrect
+/// result and is commonly used legitimately in ranges ("pages 5–10").
 pub(crate) fn normalize_quotes(input: &str) -> String {
-    input
+    let quotes_fixed = input
         .replace(['\u{201C}', '\u{201D}'], "\"") // left/right double quotation marks ""
         .replace(['\u{2018}', '\u{2019}'], "'") // left/right single quotation marks ''
         .replace(['\u{00AB}', '\u{00BB}', '\u{2033}'], "\"") // angle quotes «» and double prime ″
         .replace('\u{2032}', "'") // prime ′
         .replace('\u{201A}', ",") // single low-9 quotation mark ‚
-        .replace('\u{201E}', "\"") // double low-9 quotation mark „
+        .replace('\u{201E}', "\""); // double low-9 quotation mark „
+                                    // Context-aware em-dash fold: only `<start|whitespace>—<ASCII letter>`.
+    let mut out = String::with_capacity(quotes_fixed.len());
+    let mut prev: Option<char> = None;
+    let mut chars = quotes_fixed.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{2014}' {
+            let at_flag_position = prev.is_none_or(char::is_whitespace)
+                && matches!(chars.peek(), Some(n) if n.is_ascii_alphabetic());
+            if at_flag_position {
+                out.push_str("--");
+            } else {
+                out.push(c);
+            }
+        } else {
+            out.push(c);
+        }
+        prev = Some(c);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -225,5 +257,74 @@ mod tests {
             normalize_quotes("claude -p \u{201C}what is 2+2?\u{201D}"),
             "claude -p \"what is 2+2?\""
         );
+    }
+
+    #[test]
+    fn normalize_em_dash_flag_prefix() {
+        // iOS autocorrect turns `--name auth` into `—name auth`, which the
+        // parser would otherwise treat as prompt text.
+        assert_eq!(
+            normalize_quotes("\u{2014}name auth fix bug"),
+            "--name auth fix bug"
+        );
+    }
+
+    #[test]
+    fn normalize_em_dash_in_middle_of_input() {
+        assert_eq!(
+            normalize_quotes("claude on \u{2014}resume auth"),
+            "claude on --resume auth"
+        );
+    }
+
+    #[test]
+    fn en_dash_is_not_normalized() {
+        // En-dash (U+2013) is common in legitimate text ranges like
+        // "pages 5–10" and is rarely an autocorrect result, so we leave it.
+        let input = "pages 5\u{2013}10";
+        assert_eq!(normalize_quotes(input), input);
+    }
+
+    #[test]
+    fn em_dash_in_prose_is_preserved() {
+        // A user typing `fix the bug—urgently` shouldn't have the em-dash
+        // folded into `--` (that would make `--urgently` look like a flag
+        // and error the prompt). Only em-dashes immediately followed by an
+        // ASCII letter AND typed in flag position get folded.
+        let input = "fix the bug\u{2014} urgently please";
+        assert_eq!(normalize_quotes(input), input);
+    }
+
+    #[test]
+    fn em_dash_between_words_with_spaces_is_preserved() {
+        // Standard prose punctuation: "word — word". Space after em-dash
+        // means no folding.
+        let input = "hello \u{2014} world";
+        assert_eq!(normalize_quotes(input), input);
+    }
+
+    #[test]
+    fn em_dash_followed_by_digit_is_preserved() {
+        // Ranges and numeric callouts typed with em-dash stay unmolested.
+        let input = "chapter 3\u{2014}4";
+        assert_eq!(normalize_quotes(input), input);
+    }
+
+    #[test]
+    fn em_dash_glued_to_preceding_word_is_preserved() {
+        // Prose: `fix the bug—urgently` keeps the em-dash because there's
+        // no whitespace immediately before it, so it can't be in flag
+        // position. This is the key prose case that mustn't be corrupted.
+        assert_eq!(
+            normalize_quotes("fix the bug\u{2014}urgently"),
+            "fix the bug\u{2014}urgently"
+        );
+    }
+
+    #[test]
+    fn em_dash_at_start_of_input_with_letter_is_folded() {
+        // This is exactly how the parser sees the flag portion of an input
+        // like `: claude —resume foo` after the prefix is stripped.
+        assert_eq!(normalize_quotes("\u{2014}resume foo"), "--resume foo");
     }
 }
