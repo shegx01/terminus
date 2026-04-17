@@ -474,15 +474,17 @@ By default, Claude conversation context is tied to the foreground terminal sessi
 : claude --name auth-refactor explain the auth middleware     # creates "auth-refactor"
 : claude --name auth-refactor now fix the JWT validation      # resumes "auth-refactor" (notifies you)
 : claude on --name auth-refactor                              # interactive mode with "auth-refactor"
+: claude on --name auth-refactor explain the auth middleware  # interactive mode AND send first prompt
 ```
 
-If the session already exists, `--name` resumes it and shows a notification. If it doesn't exist, it creates a new one.
+If the session already exists, `--name` resumes it and shows a notification. If it doesn't exist, it creates a new one. With `on`, any text after the flags is sent as the first prompt.
 
 **Strict resume (`--resume` / `--continue`):**
 
 ```
 : claude --resume auth-refactor add rate limiting             # resumes, errors if not found
 : claude --resume typo                                        # → "No session named 'typo'"
+: claude on --resume review please look at the PR             # enter interactive mode, resume "review", send prompt
 ```
 
 Use `--resume` when you know the session exists and want to catch typos. `--continue` is an alias for `--resume`.

@@ -832,6 +832,7 @@ impl App {
             ParsedCommand::HarnessOn {
                 harness: kind,
                 options,
+                initial_prompt,
             } => {
                 // Verify the harness is actually registered (stubs are not)
                 if !self.harnesses.contains_key(&kind) {
@@ -937,6 +938,18 @@ impl App {
                             )
                         };
                         self.send_reply(&msg.reply_context, &opts_msg).await;
+                        // Fire the initial prompt, if provided (e.g.
+                        // `: claude on --resume review please look at the bag`).
+                        if let Some(ref prompt) = initial_prompt {
+                            self.send_harness_prompt(
+                                &msg.reply_context,
+                                &kind,
+                                prompt,
+                                &msg.attachments,
+                                &options,
+                            )
+                            .await;
+                        }
                         return;
                     }
                     // Check resume support of the CURRENT harness before switching away
@@ -982,6 +995,9 @@ impl App {
                     .as_deref()
                     .or(options.resume.as_deref())
                     .map(|s| s.to_string());
+                // Keep a copy for the optional initial prompt, since
+                // `set_harness` moves `options` into session state.
+                let options_for_prompt = initial_prompt.as_ref().map(|_| options.clone());
                 self.session_mgr.set_harness(&fg, Some(kind), options);
                 self.session_mgr.set_named_session_resolved(resolved_name);
                 self.send_reply(
@@ -996,6 +1012,17 @@ impl App {
                     ),
                 )
                 .await;
+                // Fire the initial prompt, if provided.
+                if let (Some(prompt), Some(opts)) = (initial_prompt, options_for_prompt) {
+                    self.send_harness_prompt(
+                        &msg.reply_context,
+                        &kind,
+                        &prompt,
+                        &msg.attachments,
+                        &opts,
+                    )
+                    .await;
+                }
             }
             ParsedCommand::HarnessOff { harness: kind } => {
                 let fg = match self.session_mgr.foreground_session() {

@@ -128,10 +128,14 @@ pub enum ParsedCommand {
     },
     /// Capture and send the current terminal screen
     Screen,
-    /// Enter interactive harness mode — plain text routes to the harness
+    /// Enter interactive harness mode — plain text routes to the harness.
+    /// If `initial_prompt` is set, the mode is enabled AND the prompt is
+    /// sent as the first message in one go
+    /// (e.g. `: claude on --resume review please look at the bag`).
     HarnessOn {
         harness: HarnessKind,
         options: HarnessOptions,
+        initial_prompt: Option<String>,
     },
     /// Exit interactive harness mode — plain text routes back to tmux
     HarnessOff {
@@ -235,14 +239,24 @@ impl ParsedCommand {
                     return Ok(ParsedCommand::HarnessOn {
                         harness: kind,
                         options: HarnessOptions::default(),
+                        initial_prompt: None,
                     });
                 }
                 // `: claude on --model sonnet --add-dir ../lib`
+                // `: claude on --resume review please look at the bag`
+                //   (flags first, then a prompt — we enable the mode AND
+                //   fire the prompt as the first message.)
                 if let Some(on_args) = after_harness.strip_prefix("on ") {
-                    let options = parse_harness_options(on_args.trim())?;
+                    let (options, prompt) = split_prompt_options(on_args.trim())?;
+                    let initial_prompt = if prompt.is_empty() {
+                        None
+                    } else {
+                        Some(prompt)
+                    };
                     return Ok(ParsedCommand::HarnessOn {
                         harness: kind,
                         options,
+                        initial_prompt,
                     });
                 }
                 if after_harness == "off" {
@@ -333,9 +347,10 @@ fn split_prompt_options(input: &str) -> std::result::Result<(HarnessOptions, Str
         return Ok((HarnessOptions::default(), prompt));
     }
 
-    // Re-join the flag tokens and parse them.
-    let flag_str = flag_tokens.join(" ");
-    let options = parse_harness_options(&flag_str)?;
+    // Parse directly from tokens — re-joining with spaces would lose the
+    // quote context on multi-word values (e.g. `--system-prompt "a b c"`
+    // would become `--system-prompt a b c`).
+    let options = parse_harness_options_tokens(flag_tokens)?;
 
     Ok((options, prompt))
 }
@@ -379,11 +394,14 @@ fn validate_harness_session_name(name: &str, flag: &str) -> std::result::Result<
 ///   --max-turns <n>                 Maximum agentic turns per prompt
 ///   --settings <path|json>          Claude Code settings file or inline JSON
 ///   --mcp-config <path>             MCP server config file
-fn parse_harness_options(input: &str) -> std::result::Result<HarnessOptions, ParseError> {
+/// Parse harness options from a pre-tokenized slice. Callers are expected
+/// to have already run `shell_tokenize` on a `normalize_quotes`-cleaned
+/// input (typically via `split_prompt_options`) so that quoted multi-word
+/// values like `--system-prompt "You are a Rust expert"` survive intact.
+fn parse_harness_options_tokens(
+    tokens: &[String],
+) -> std::result::Result<HarnessOptions, ParseError> {
     let mut opts = HarnessOptions::default();
-    // Normalize smart/curly quotes from mobile keyboards before tokenizing
-    let normalized = normalize_quotes(input);
-    let tokens = shell_tokenize(&normalized);
     let mut i = 0;
 
     while i < tokens.len() {
@@ -926,6 +944,7 @@ mod tests {
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Claude,
                 options: HarnessOptions::default(),
+                initial_prompt: None,
             }
         );
     }
@@ -957,6 +976,7 @@ mod tests {
             ParsedCommand::HarnessOn {
                 harness: HarnessKind::Gemini,
                 options: HarnessOptions::default(),
+                initial_prompt: None,
             }
         );
     }
@@ -1159,6 +1179,7 @@ mod tests {
                     model: Some("sonnet".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1174,6 +1195,7 @@ mod tests {
                     model: Some("opus".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1189,6 +1211,7 @@ mod tests {
                     effort: Some("high".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1211,6 +1234,7 @@ mod tests {
                     add_dirs: vec![PathBuf::from("../lib")],
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1227,6 +1251,7 @@ mod tests {
                     add_dirs: vec![PathBuf::from("../lib"), PathBuf::from("../shared")],
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1242,6 +1267,7 @@ mod tests {
                     max_turns: Some(5),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1265,6 +1291,7 @@ mod tests {
                     system_prompt: Some("You are a Rust expert".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1287,6 +1314,7 @@ mod tests {
                     max_turns: Some(10),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1316,6 +1344,7 @@ mod tests {
                     settings: Some("./settings.json".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1331,6 +1360,7 @@ mod tests {
                     mcp_config: Some(PathBuf::from("./mcp.json")),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1350,6 +1380,7 @@ mod tests {
                     append_system_prompt: Some("Always use TypeScript".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1365,6 +1396,7 @@ mod tests {
                     permission_mode: Some("acceptEdits".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1380,6 +1412,7 @@ mod tests {
                     permission_mode: Some("bypassPermissions".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1479,6 +1512,7 @@ mod tests {
                     model: Some("sonnet".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1495,6 +1529,7 @@ mod tests {
                     effort: Some("high".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1522,6 +1557,7 @@ mod tests {
                     system_prompt: Some("Be concise".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1542,6 +1578,7 @@ mod tests {
                     system_prompt: Some("Be concise".into()),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
@@ -1842,6 +1879,101 @@ mod tests {
         }
     }
 
+    // ── HarnessOn with trailing initial prompt ───────────────────────────────
+
+    #[test]
+    fn parse_on_with_resume_and_initial_prompt() {
+        let cmd = ParsedCommand::parse(": claude on --resume review please look at the bag", ':')
+            .unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                options,
+                initial_prompt,
+                ..
+            } => {
+                assert_eq!(options.resume, Some("review".into()));
+                assert_eq!(initial_prompt.as_deref(), Some("please look at the bag"));
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_on_with_em_dashed_resume_and_initial_prompt() {
+        // The full mobile-chat case that triggered the bug report:
+        // iOS autocorrect turns `--resume` into `—resume`, and `on` mode
+        // must accept a trailing prompt.
+        let cmd = ParsedCommand::parse(
+            ": claude on \u{2014}resume review please review the background color of the bag",
+            ':',
+        )
+        .unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                options,
+                initial_prompt,
+                ..
+            } => {
+                assert_eq!(options.resume, Some("review".into()));
+                assert_eq!(
+                    initial_prompt.as_deref(),
+                    Some("please review the background color of the bag")
+                );
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_on_with_continue_alias_no_prompt() {
+        let cmd = ParsedCommand::parse(": claude on --continue review", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                options,
+                initial_prompt,
+                ..
+            } => {
+                assert_eq!(options.resume, Some("review".into()));
+                assert!(initial_prompt.is_none());
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_on_with_name_and_initial_prompt() {
+        let cmd = ParsedCommand::parse(": claude on --name auth fix the login bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                options,
+                initial_prompt,
+                ..
+            } => {
+                assert_eq!(options.name, Some("auth".into()));
+                assert_eq!(initial_prompt.as_deref(), Some("fix the login bug"));
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_on_without_flags_treats_all_as_prompt() {
+        // Backward-compat path: previously `: claude on foo` errored; now it
+        // enters interactive mode and sends `foo` as the initial prompt.
+        let cmd = ParsedCommand::parse(": claude on hello there", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessOn {
+                options,
+                initial_prompt,
+                ..
+            } => {
+                assert!(options.is_empty());
+                assert_eq!(initial_prompt.as_deref(), Some("hello there"));
+            }
+            other => panic!("Expected HarnessOn, got {:?}", other),
+        }
+    }
+
     #[test]
     fn parse_name_and_resume_rejected() {
         let err = ParsedCommand::parse(": claude --name auth --resume auth fix", ':').unwrap_err();
@@ -1866,6 +1998,7 @@ mod tests {
                     max_turns: Some(5),
                     ..Default::default()
                 },
+                initial_prompt: None,
             }
         );
     }
