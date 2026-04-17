@@ -845,65 +845,49 @@ impl App {
                     }
                 };
                 // Validate --name/--resume on non-resumable harnesses
-                if options.name.is_some() || options.resume.is_some() {
-                    if let Some(h) = self.harnesses.get(&kind) {
-                        if !h.supports_resume() {
+                if self
+                    .reject_if_not_resumable(&msg.reply_context, &kind, &options)
+                    .await
+                {
+                    return;
+                }
+
+                // Resolve named session for --name/--resume. We do NOT pre-create
+                // an empty-session_id entry here — persistence happens only after
+                // the first prompt returns a real session_id. This keeps the
+                // state file free of "zombie" entries when the user runs
+                // `claude on --name foo` then exits without prompting, and
+                // avoids the "exists but has no conversation yet" dead-end on
+                // a subsequent `--resume foo`.
+                let mut named_notification: Option<String> = None;
+                if let Some(ref resume_name) = options.resume {
+                    match self.named_harness_sessions.get(resume_name) {
+                        Some(entry) if !entry.session_id.is_empty() => {
+                            named_notification =
+                                Some(format!("Resuming session '{}'", resume_name));
+                        }
+                        _ => {
                             self.send_error(
                                 &msg.reply_context,
                                 &format!(
-                                    "--name/--resume not supported for {} (no session resume)",
-                                    kind.name()
+                                    "No session named '{}'. Use --name to create one.",
+                                    resume_name
                                 ),
                             )
                             .await;
                             return;
                         }
                     }
-                }
-
-                // Resolve named session for --name/--resume
-                let mut named_notification: Option<String> = None;
-                if let Some(ref resume_name) = options.resume {
-                    if !self.named_harness_sessions.contains_key(resume_name) {
-                        self.send_error(
-                            &msg.reply_context,
-                            &format!(
-                                "No session named '{}'. Use --name to create one.",
-                                resume_name
-                            ),
-                        )
-                        .await;
-                        return;
-                    }
-                    named_notification = Some(format!("Resuming session '{}'", resume_name));
                 } else if let Some(ref name) = options.name {
-                    if self.named_harness_sessions.contains_key(name) {
-                        named_notification = Some(format!("Resuming existing session '{}'", name));
+                    let is_resumable = self
+                        .named_harness_sessions
+                        .get(name)
+                        .is_some_and(|e| !e.session_id.is_empty());
+                    named_notification = Some(if is_resumable {
+                        format!("Resuming existing session '{}'", name)
                     } else {
-                        named_notification = Some(format!("Created new session '{}'", name));
-                        // Pre-create entry so subsequent StdinInput prompts find it
-                        let entry = NamedSessionEntry {
-                            session_id: String::new(), // populated after first prompt
-                            cwd: std::env::current_dir().unwrap_or_default(),
-                            last_used: Utc::now(),
-                        };
-                        // Atomic batch: evict + insert in a single StateUpdate
-                        let mut batch_ops: Vec<(String, Option<NamedSessionEntry>)> = Vec::new();
-                        if self.named_harness_sessions.len() >= self.max_named_sessions {
-                            if let Some(evicted) = self.evict_lru_session() {
-                                batch_ops.push((evicted, None));
-                            }
-                        }
-                        self.named_harness_sessions
-                            .insert(name.clone(), entry.clone());
-                        batch_ops.push((name.clone(), Some(entry)));
-                        if let Err(e) = self
-                            .state_tx
-                            .try_send(StateUpdate::HarnessSessionBatch(batch_ops))
-                        {
-                            tracing::warn!("state_tx full, session update dropped: {}", e);
-                        }
-                    }
+                        format!("Created new session '{}'", name)
+                    });
                 }
 
                 // Check if switching from another harness or updating options
@@ -1184,6 +1168,35 @@ impl App {
         oldest
     }
 
+    /// Send an error and return `true` if `--name`/`--resume` are specified
+    /// on a harness that doesn't support resume. Callers should `return`
+    /// immediately when this returns `true`.
+    async fn reject_if_not_resumable(
+        &self,
+        ctx: &ReplyContext,
+        kind: &HarnessKind,
+        options: &HarnessOptions,
+    ) -> bool {
+        if options.name.is_none() && options.resume.is_none() {
+            return false;
+        }
+        let Some(h) = self.harnesses.get(kind) else {
+            return false;
+        };
+        if h.supports_resume() {
+            return false;
+        }
+        self.send_error(
+            ctx,
+            &format!(
+                "--name/--resume not supported for {} (no session resume)",
+                kind.name()
+            ),
+        )
+        .await;
+        true
+    }
+
     /// Send a prompt to a harness (Claude, Gemini, Codex) with real-time streaming to chat.
     async fn send_harness_prompt(
         &mut self,
@@ -1194,20 +1207,8 @@ impl App {
         options: &HarnessOptions,
     ) {
         // Check --name/--resume on non-resumable harnesses
-        if options.name.is_some() || options.resume.is_some() {
-            if let Some(h) = self.harnesses.get(kind) {
-                if !h.supports_resume() {
-                    self.send_error(
-                        ctx,
-                        &format!(
-                            "--name/--resume not supported for {} (no session resume)",
-                            kind.name()
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-            }
+        if self.reject_if_not_resumable(ctx, kind, options).await {
+            return;
         }
 
         // Resolve session name from flags, falling back to implicit path
@@ -1218,7 +1219,7 @@ impl App {
         let mut notification: Option<String> = None;
 
         if let Some(ref resume_name) = options.resume {
-            // --resume: strict lookup, error if not found
+            // --resume: strict lookup, error if not found (or has no session_id yet)
             match self.named_harness_sessions.get(resume_name) {
                 Some(entry) if !entry.session_id.is_empty() => {
                     session_name = resume_name.clone();
@@ -1226,19 +1227,7 @@ impl App {
                     cwd = entry.cwd.clone();
                     using_named_session = true;
                 }
-                Some(_) => {
-                    // Entry exists but was pre-created by HarnessOn and never prompted
-                    self.send_error(
-                        ctx,
-                        &format!(
-                            "Session '{}' exists but has no conversation yet. Use --name instead.",
-                            resume_name
-                        ),
-                    )
-                    .await;
-                    return;
-                }
-                None => {
+                _ => {
                     self.send_error(
                         ctx,
                         &format!(
@@ -1252,13 +1241,13 @@ impl App {
             }
         } else if let Some(ref name) = options.name {
             // --name: create-or-resume (upsert)
-            if let Some(entry) = self.named_harness_sessions.get(name) {
+            if let Some(entry) = self
+                .named_harness_sessions
+                .get(name)
+                .filter(|e| !e.session_id.is_empty())
+            {
                 session_name = name.clone();
-                resume_id = if entry.session_id.is_empty() {
-                    None
-                } else {
-                    Some(entry.session_id.clone())
-                };
+                resume_id = Some(entry.session_id.clone());
                 cwd = entry.cwd.clone();
                 using_named_session = true;
                 // Only notify if this session hasn't been resolved yet in
@@ -1272,7 +1261,7 @@ impl App {
                 // New session — record current cwd
                 session_name = name.clone();
                 resume_id = None;
-                cwd = std::env::current_dir().unwrap_or_default();
+                cwd = current_dir_or_dot();
                 using_named_session = true;
             }
         } else {
@@ -1287,7 +1276,7 @@ impl App {
                 .harnesses
                 .get(kind)
                 .and_then(|h| h.get_session_id(&session_name));
-            cwd = std::env::current_dir().unwrap_or_default();
+            cwd = current_dir_or_dot();
         }
 
         let harness = match self.harnesses.get(kind) {
@@ -1335,9 +1324,18 @@ impl App {
                     status: status.to_string(),
                 });
 
-                if let Some(sid) = session_id {
-                    if using_named_session {
-                        // Upsert into named session index
+                if using_named_session {
+                    // Prefer the session_id returned from this run; otherwise
+                    // fall back to the existing entry's id so that a zero-output
+                    // resume still refreshes `last_used` (prevents the session
+                    // from becoming a stale eviction target).
+                    let effective_sid = session_id.or_else(|| {
+                        self.named_harness_sessions
+                            .get(&session_name)
+                            .map(|e| e.session_id.clone())
+                            .filter(|s| !s.is_empty())
+                    });
+                    if let Some(sid) = effective_sid {
                         let entry = NamedSessionEntry {
                             session_id: sid,
                             cwd: cwd.clone(),
@@ -1365,11 +1363,11 @@ impl App {
                             tracing::warn!("state_tx full, session update dropped: {}", e);
                         }
                         // Skip harness.set_session_id() — prevents cross-index leakage
-                    } else {
-                        // Implicit path — use existing harness-internal tracking
-                        if let Some(h) = self.harnesses.get(kind) {
-                            h.set_session_id(&session_name, sid);
-                        }
+                    }
+                } else if let Some(sid) = session_id {
+                    // Implicit path — use existing harness-internal tracking
+                    if let Some(h) = self.harnesses.get(kind) {
+                        h.set_session_id(&session_name, sid);
                     }
                 }
                 if !got_output {
@@ -1417,6 +1415,13 @@ async fn cleanup_attachments(attachments: &[Attachment]) {
     for att in attachments {
         let _ = tokio::fs::remove_file(&att.path).await;
     }
+}
+
+/// Resolve the current working directory, falling back to `"."` when the
+/// platform call fails (matches `App::new`'s original fallback and avoids
+/// propagating an empty `PathBuf` into the session index).
+fn current_dir_or_dot() -> std::path::PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
 }
 
 #[cfg(test)]
@@ -1744,5 +1749,99 @@ patterns = []
             found_bind,
             "expected StateUpdate::BindDiscordChat to be emitted"
         );
+    }
+
+    // ─── Named session / LRU tests ───────────────────────────────────────────
+
+    fn make_entry(sid: &str, secs_ago: i64) -> NamedSessionEntry {
+        NamedSessionEntry {
+            session_id: sid.into(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            last_used: Utc::now() - chrono::Duration::seconds(secs_ago),
+        }
+    }
+
+    #[tokio::test]
+    async fn evict_lru_session_removes_oldest_entry() {
+        let dir = tempdir().unwrap();
+        let (mut app, _state_rx) = make_app(dir.path());
+
+        app.named_harness_sessions
+            .insert("new".into(), make_entry("sid-new", 5));
+        app.named_harness_sessions
+            .insert("oldest".into(), make_entry("sid-old", 3600));
+        app.named_harness_sessions
+            .insert("middle".into(), make_entry("sid-mid", 300));
+
+        let evicted = app.evict_lru_session();
+        assert_eq!(evicted.as_deref(), Some("oldest"));
+        assert_eq!(app.named_harness_sessions.len(), 2);
+        assert!(!app.named_harness_sessions.contains_key("oldest"));
+        assert!(app.named_harness_sessions.contains_key("new"));
+        assert!(app.named_harness_sessions.contains_key("middle"));
+    }
+
+    #[tokio::test]
+    async fn evict_lru_session_on_empty_index_returns_none() {
+        let dir = tempdir().unwrap();
+        let (mut app, _state_rx) = make_app(dir.path());
+        assert!(app.evict_lru_session().is_none());
+    }
+
+    #[tokio::test]
+    async fn named_session_round_trips_through_state_store() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("terminus-state.json");
+
+        // Seed the store with a batch, persist, then reload from disk.
+        {
+            let mut store = StateStore::load(&state_path).unwrap();
+            let entry = NamedSessionEntry {
+                session_id: "sid-auth".into(),
+                cwd: std::path::PathBuf::from("/tmp/project"),
+                last_used: Utc::now(),
+            };
+            store.apply(StateUpdate::HarnessSessionBatch(vec![(
+                "auth".into(),
+                Some(entry),
+            )]));
+            store.persist().unwrap();
+        }
+
+        // Second App::new should see the persisted entry in its index.
+        let config = make_test_config(dir.path());
+        let store = StateStore::load(&state_path).unwrap();
+        let (state_tx, _state_rx) = mpsc::channel::<StateUpdate>(64);
+        let app = App::new(&config, store, state_tx).unwrap();
+        assert_eq!(app.named_harness_sessions.len(), 1);
+        let entry = app
+            .named_harness_sessions
+            .get("auth")
+            .expect("auth entry should survive reload");
+        assert_eq!(entry.session_id, "sid-auth");
+        assert_eq!(entry.cwd, std::path::PathBuf::from("/tmp/project"));
+    }
+
+    #[tokio::test]
+    async fn reject_if_not_resumable_is_noop_without_flags() {
+        let dir = tempdir().unwrap();
+        let (app, _state_rx) = make_app(dir.path());
+        let ctx = ReplyContext {
+            platform: PlatformType::Telegram,
+            chat_id: "0".into(),
+            thread_ts: None,
+            socket_reply_tx: None,
+        };
+        let opts = HarnessOptions::default();
+        assert!(
+            !app.reject_if_not_resumable(&ctx, &HarnessKind::Claude, &opts)
+                .await
+        );
+    }
+
+    #[test]
+    fn current_dir_or_dot_never_returns_empty_path() {
+        let p = super::current_dir_or_dot();
+        assert!(!p.as_os_str().is_empty());
     }
 }
