@@ -120,6 +120,23 @@ impl Harness for OpencodeHarness {
     ) -> Result<mpsc::Receiver<HarnessEvent>> {
         let (event_tx, event_rx) = mpsc::channel::<HarnessEvent>(256);
 
+        // Opencode's CLI has no schema-constrained output surface (only
+        // `--format default|json`). Fail fast rather than silently ignoring
+        // the user's `--schema` flag.
+        if options.schema.is_some() {
+            let _ = event_tx
+                .send(HarnessEvent::Error(
+                    "opencode does not support --schema; use the claude harness for structured output".into(),
+                ))
+                .await;
+            let _ = event_tx
+                .send(HarnessEvent::Done {
+                    session_id: String::new(),
+                })
+                .await;
+            return Ok(event_rx);
+        }
+
         let binary: PathBuf = self
             .config
             .binary_path
@@ -1037,6 +1054,47 @@ mod tests {
         assert_eq!(
             build_session_key(HarnessKind::Opencode, "auth-v2_review"),
             "opencode:auth-v2_review"
+        );
+    }
+
+    // ── Schema guard (opencode CLI has no schema surface) ────────────────────
+
+    #[tokio::test]
+    async fn schema_option_errors_out_immediately() {
+        let h = empty_harness();
+        let opts = HarnessOptions {
+            schema: Some("person_v1".to_string()),
+            ..Default::default()
+        };
+        let cwd = std::env::temp_dir();
+        let mut rx = h
+            .run_prompt("ignored", &[], &cwd, None, &opts)
+            .await
+            .expect("run_prompt returns receiver");
+
+        let first = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("recv timeout")
+            .expect("first event must arrive");
+        match first {
+            HarnessEvent::Error(msg) => {
+                assert!(
+                    msg.contains("schema") && msg.contains("claude"),
+                    "error must mention schema + claude fallback, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+
+        let second = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("recv timeout")
+            .expect("Done must follow Error");
+        assert!(
+            matches!(second, HarnessEvent::Done { .. }),
+            "expected Done after Error, got {:?}",
+            second
         );
     }
 
