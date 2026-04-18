@@ -14,7 +14,7 @@
 //! ## Event translation (see `translate_event`)
 //!
 //! Observed event shapes from `opencode run --format json`:
-//! - `{"type":"step_start", "sessionID":"ses_…", "part":{…}}` — captured for session id
+//! - `{"type":"step_start", "sessionID":"ses_…", "part":{…}}` — tracked for open-step counter (multi-step flow guard); also source of sessionID capture
 //! - `{"type":"text", "sessionID":"…", "part":{"text":"…"}}` — translated to `Text`
 //! - `{"type":"step_finish", …}` — terminal; stops the read loop
 //! - `{"type":"tool_use", …, "part":{"tool":"bash","state":{"status":"completed","input":{…},"output":"…"}}}` — translated to `ToolUse`
@@ -610,6 +610,16 @@ impl OpencodeHarness {
     }
 }
 
+/// Returns `true` when the multi-step read loop should break.
+///
+/// The invariant: we only stop reading when at least one `step_finish` has
+/// arrived AND all opened steps are balanced (open_steps ≤ 0). A negative
+/// open_steps is treated defensively the same as zero (break).
+#[inline]
+fn should_break_on_step_finish(open_steps: i32, received_any_finish: bool) -> bool {
+    received_any_finish && open_steps <= 0
+}
+
 /// Spawn the opencode child, read newline-delimited JSON events from stdout,
 /// translate them, and emit `HarnessEvent::Done` on clean exit or
 /// `HarnessEvent::Error` on non-zero exit.
@@ -754,7 +764,7 @@ async fn run_opencode_inner(
                 // one step_finish has arrived. This correctly handles multi-step
                 // agentic flows: step_start → tool_use → step_finish →
                 // step_start → text → step_finish.
-                if received_any_finish && open_steps <= 0 {
+                if should_break_on_step_finish(open_steps, received_any_finish) {
                     break;
                 }
             }
@@ -1720,6 +1730,74 @@ mod tests {
     fn strip_ansi_handles_osc_titlebar_sequence() {
         let input = "\x1b]0;title\x07body";
         assert_eq!(strip_ansi(input), "body");
+    }
+
+    // ── sanitize_stderr unit tests ───────────────────────────────────────────
+
+    #[test]
+    fn sanitize_stderr_truncates_at_500_chars() {
+        let long = "x".repeat(600);
+        let out = sanitize_stderr(&long);
+        assert!(out.len() <= 500);
+    }
+
+    #[test]
+    fn sanitize_stderr_redacts_env_var_assignments() {
+        let input = "OPENROUTER_API_KEY=sk-or-abc123 failed to connect";
+        let out = sanitize_stderr(input);
+        assert!(
+            !out.contains("sk-or-abc123"),
+            "API key value leaked: {}",
+            out
+        );
+        assert!(out.contains("OPENROUTER_API_KEY"), "key name should remain");
+    }
+
+    #[test]
+    fn sanitize_stderr_redacts_user_paths() {
+        let input = "failed at /Users/alice/src/bar error";
+        let out = sanitize_stderr(input);
+        assert!(!out.contains("/Users/alice/"), "user path leaked: {}", out);
+    }
+
+    #[test]
+    fn sanitize_stderr_handles_home_path_style() {
+        let input = "/home/bob/thing exploded";
+        let out = sanitize_stderr(input);
+        assert!(!out.contains("/home/bob/"), "home path leaked: {}", out);
+    }
+
+    #[test]
+    fn sanitize_stderr_preserves_non_sensitive_content() {
+        let input = "model quota exceeded; try again tomorrow";
+        let out = sanitize_stderr(input);
+        assert!(out.contains("quota exceeded"), "legit content dropped");
+    }
+
+    // ── should_break_on_step_finish ──────────────────────────────────────────
+
+    #[test]
+    fn step_finish_no_finish_yet_does_not_break() {
+        // open_steps=0, received_any=false → still waiting for the first step_finish
+        assert!(!should_break_on_step_finish(0, false));
+    }
+
+    #[test]
+    fn step_finish_open_steps_remain_does_not_break() {
+        // open_steps=1, received_any=true → a second step is still open
+        assert!(!should_break_on_step_finish(1, true));
+    }
+
+    #[test]
+    fn step_finish_balanced_breaks() {
+        // open_steps=0, received_any=true → all steps closed, should break
+        assert!(should_break_on_step_finish(0, true));
+    }
+
+    #[test]
+    fn step_finish_negative_open_steps_breaks_defensively() {
+        // open_steps=-1, received_any=true → defensive: treat as balanced
+        assert!(should_break_on_step_finish(-1, true));
     }
 
     // ── argv_construction_threads_all_per_prompt_flags ──────────────────────

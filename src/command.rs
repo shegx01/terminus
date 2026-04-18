@@ -2444,6 +2444,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_opencode_on_em_dashed_name() {
+        // iOS keyboard autocorrects `--` to `—` (U+2014). Should still parse as --name.
+        let parsed = ParsedCommand::parse(": opencode on \u{2014}name review hi", ':').unwrap();
+        match parsed {
+            ParsedCommand::HarnessOn {
+                harness,
+                options,
+                initial_prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.name.as_deref(), Some("review"));
+                assert_eq!(initial_prompt.as_deref(), Some("hi"));
+            }
+            other => panic!("expected HarnessOn, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn parse_opencode_mutual_exclusion_rejected() {
         let err = ParsedCommand::parse(": opencode --name foo --resume bar hi", ':').unwrap_err();
         assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
@@ -2567,6 +2585,47 @@ mod tests {
     fn parse_opencode_blocked_subcommand_upgrade() {
         let err = ParsedCommand::parse(": opencode upgrade", ':').unwrap_err();
         assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+    }
+
+    #[test]
+    fn parse_opencode_blocked_subcommands_all_rejected() {
+        let blocked = [
+            "uninstall",
+            "upgrade",
+            "login",
+            "logout",
+            "serve",
+            "web",
+            "acp",
+            "attach",
+            "import",
+            "mcp",
+            "agent",
+            "github",
+            "debug",
+            "tui",
+            "session",
+            "auth",
+        ];
+        for kw in &blocked {
+            let input = format!(": opencode {}", kw);
+            match ParsedCommand::parse(&input, ':') {
+                Err(ParseError::InvalidHarnessOption(msg)) => {
+                    assert!(
+                        msg.contains("not available from chat")
+                            || msg.contains("run it in your terminal")
+                            || msg.contains("Safe chat subcommands"),
+                        "blocked keyword `{}` did not surface a terminal-only error; got: {}",
+                        kw,
+                        msg
+                    );
+                }
+                other => panic!(
+                    "blocked keyword `{}` should be rejected, got {:?}",
+                    kw, other
+                ),
+            }
+        }
     }
 
     // Verify other harnesses don't get the subcommand path (fall through to prompt).
