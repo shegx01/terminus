@@ -190,6 +190,8 @@ Is this idiomatic Rust?
 : opencode export ses_abc...        # dump a session as JSON
 ```
 
+**Full flag + subcommand reference:** [docs/opencode.md](docs/opencode.md)
+
 **Programmatic access** -- drive terminus from scripts, agents, or dashboards via WebSocket:
 
 ```bash
@@ -392,6 +394,8 @@ Optional overrides:
 **Requirements:** `opencode` on PATH (same pattern as `tmux`). Run `opencode auth login` once before using any `: opencode ...` commands.
 
 **Blocked from chat** (run in your terminal instead): `acp`, `agent`, `attach`, `auth`, `debug`, `github`, `import`, `login`, `logout`, `mcp`, `serve`, `session`, `tui`, `uninstall`, `upgrade`, `web`. Terminus returns a clear error if you try these from chat. Note: `session list` / `session ls` and `auth list` / `auth ls` ARE supported as safe read-only aliases.
+
+See [docs/opencode.md](docs/opencode.md) for the full CLI reference.
 
 ### Multiple platforms
 

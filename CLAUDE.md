@@ -178,17 +178,9 @@ Optional `[harness.opencode]` overrides (see `terminus.example.toml`):
 - `model`: pass `-m <value>` to `opencode run` (default: opencode's own default)
 - `agent`: pass `--agent <value>` to `opencode run` (default: opencode's own default)
 
-**Supported subcommands from chat** (`: opencode <sub> [args]`):
-- `: opencode models [provider]` — list configured models, optionally filtered by provider
-- `: opencode stats [--days N] [--tools] [--models] [--project]` — token/cost usage
-- `: opencode sessions [--max-count N]` — recent session IDs (alias for `session list`)
-- `: opencode providers` — configured providers (alias for `auth list`)
-- `: opencode export <sessionID>` — export one session as JSON
+**Supported subcommands from chat:** `models`, `stats`, `sessions` (`session list`/`ls`), `providers` (`auth list`/`ls`), `export <id>`. Full reference: [docs/opencode.md](docs/opencode.md).
 
-**Blocked from chat** (return a clear error; run in terminal): `acp`, `agent`,
-`attach`, `auth`, `debug`, `github`, `import`, `login`, `logout`, `mcp`, `serve`,
-`session`, `tui`, `uninstall`, `upgrade`, `web`. Note: `session list` / `session ls`
-and `auth list` / `auth ls` ARE supported as safe read-only aliases.
+**Blocked from chat** (chat-safe errors returned; run in terminal): `acp`, `agent`, `attach`, `auth`, `debug`, `github`, `import`, `login`, `logout`, `mcp`, `serve`, `session`, `tui`, `uninstall`, `upgrade`, `web`. Full details in [docs/opencode.md](docs/opencode.md).
 
 **Per-prompt flags** (`: opencode [flags] <prompt>`):
 - `--name <x>` / `--resume <x>` / `--continue <x>` — named session
@@ -199,6 +191,8 @@ and `auth list` / `auth ls` ARE supported as safe read-only aliases.
 - `--share` — ask opencode for a shareable URL
 - `--pure` — run without external plugins
 - `--fork` — fork the session before continuing (requires `--continue` or `--resume`)
+
+Full flag semantics and mutual exclusion: [docs/opencode.md#per-prompt-flags](docs/opencode.md#per-prompt-flags).
 
 Subcommand output is wrapped in a fenced code block and truncated at 3000
 chars. For long outputs, run the CLI in your terminal.
