@@ -224,6 +224,14 @@ pub enum ParseError {
 
 const MAX_SESSION_NAME_LEN: usize = 64;
 
+/// Replace em-dash (—, U+2014) and en-dash (–, U+2013) with `--`.
+/// Mobile keyboards (iOS autocorrect) frequently convert `--` to `—`, which
+/// breaks flag parsing. Applying this normalization before tokenizing restores
+/// the intended flag form.
+fn normalize_em_dash(s: &str) -> String {
+    s.replace(['\u{2014}', '\u{2013}'], "--")
+}
+
 fn validate_session_name(name: &str) -> std::result::Result<(), ParseError> {
     if name.is_empty() {
         return Err(ParseError::MissingName);
@@ -339,20 +347,38 @@ impl ParsedCommand {
                 // providers, export) and a destructive-command blocklist. Other harnesses
                 // fall straight through to prompt parsing.
                 if kind == HarnessKind::Opencode && !after_harness.is_empty() {
-                    let mut subword_iter = after_harness.split_whitespace();
+                    // Normalize em-dashes (— / –) to -- so mobile keyboards don't break
+                    // subcommand flag args like `stats —days 1` → `stats --days 1`.
+                    let normalized_after = normalize_em_dash(after_harness);
+                    let mut subword_iter = normalized_after.split_whitespace().peekable();
                     let first = subword_iter.next().unwrap_or("");
-                    let rest_args: Vec<String> = subword_iter.map(String::from).collect();
+                    let second = subword_iter.peek().copied().unwrap_or("");
 
-                    // Safe read-only subcommands.
-                    let sub = match first {
-                        "models" => Some(OpencodeSubcommand::Models),
-                        "stats" => Some(OpencodeSubcommand::Stats),
-                        "sessions" => Some(OpencodeSubcommand::Sessions),
-                        "providers" => Some(OpencodeSubcommand::Providers),
-                        "export" => Some(OpencodeSubcommand::Export),
-                        _ => None,
+                    // Match user-friendly 1-word aliases and native 2-word opencode forms.
+                    let (sub, consumed_two) = match (first, second) {
+                        // 1-word aliases (our user-friendly forms)
+                        ("models", _) => (Some(OpencodeSubcommand::Models), false),
+                        ("stats", _) => (Some(OpencodeSubcommand::Stats), false),
+                        ("sessions", _) => (Some(OpencodeSubcommand::Sessions), false),
+                        ("providers", _) => (Some(OpencodeSubcommand::Providers), false),
+                        ("export", _) => (Some(OpencodeSubcommand::Export), false),
+                        // 2-word native opencode forms — consume both words
+                        ("session", "list") | ("session", "ls") => {
+                            (Some(OpencodeSubcommand::Sessions), true)
+                        }
+                        ("auth", "list") | ("auth", "ls") => {
+                            (Some(OpencodeSubcommand::Providers), true)
+                        }
+                        _ => (None, false),
                     };
+
                     if let Some(subcommand) = sub {
+                        // Consume the second word if the native 2-word form was matched.
+                        if consumed_two {
+                            let _ = subword_iter.next();
+                        }
+                        let rest_args: Vec<String> = subword_iter.map(String::from).collect();
+
                         // `export` REQUIRES an argument; reject early with a helpful message.
                         if matches!(subcommand, OpencodeSubcommand::Export) && rest_args.is_empty()
                         {
@@ -369,10 +395,13 @@ impl ParsedCommand {
 
                     // Blocklist: destructive / interactive / TTY-bound subcommands.
                     // Return a chat-safe error — DO NOT silently treat these as prompts.
+                    // Note: bare `session` and `auth` (without a recognized sub-word) also
+                    // fall into this blocklist.
                     const BLOCKED: &[&str] = &[
                         "uninstall",
                         "upgrade",
                         "auth",
+                        "session",
                         "login",
                         "logout",
                         "serve",
@@ -2462,8 +2491,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_opencode_blocked_subcommand_auth() {
-        let err = ParsedCommand::parse(": opencode auth list", ':').unwrap_err();
+    fn parse_opencode_blocked_subcommand_bare_auth() {
+        // Bare `auth` (no sub-word) is blocked.
+        let err = ParsedCommand::parse(": opencode auth", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("not available from chat"), "got: {}", msg);
+    }
+
+    #[test]
+    fn parse_opencode_blocked_subcommand_auth_login() {
+        // `auth login` is NOT a recognized form (only `auth list`/`auth ls` are).
+        // After failing to match the 2-word native form, `auth` hits the blocklist.
+        let err = ParsedCommand::parse(": opencode auth login", ':').unwrap_err();
         assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
         let msg = err.to_string();
         assert!(msg.contains("not available from chat"), "got: {}", msg);
@@ -2620,5 +2660,106 @@ mod tests {
             }
             other => panic!("Expected HarnessPrompt, got {:?}", other),
         }
+    }
+
+    // ── Native opencode form tests ─────────────────────────────────────────────
+
+    #[test]
+    fn parse_opencode_session_list_maps_to_sessions_subcommand() {
+        let cmd = ParsedCommand::parse(": opencode session list", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Sessions,
+                args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_session_ls_maps_to_sessions_subcommand() {
+        let cmd = ParsedCommand::parse(": opencode session ls", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Sessions,
+                args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_auth_list_maps_to_providers_subcommand() {
+        let cmd = ParsedCommand::parse(": opencode auth list", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Providers,
+                args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_auth_ls_maps_to_providers_subcommand() {
+        let cmd = ParsedCommand::parse(": opencode auth ls", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Providers,
+                args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_bare_session_is_blocked() {
+        let err = ParsedCommand::parse(": opencode session", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("not available from chat"), "got: {}", msg);
+    }
+
+    #[test]
+    fn parse_opencode_bare_auth_is_blocked() {
+        // Verify via a freshly-named test (the old `parse_opencode_blocked_subcommand_bare_auth`
+        // tests the same behavior; this one is the canonical name requested).
+        let err = ParsedCommand::parse(": opencode auth", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("not available from chat"), "got: {}", msg);
+    }
+
+    #[test]
+    fn parse_opencode_stats_em_dash_days_normalized() {
+        // iOS autocorrect: `—days` should become `--days` after em-dash normalization.
+        let cmd = ParsedCommand::parse(": opencode stats \u{2014}days 1", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Stats,
+                args: vec!["--days".into(), "1".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_opencode_models_em_dash_flag_normalized() {
+        // En-dash variant (–) should also normalize to --.
+        let cmd =
+            ParsedCommand::parse(": opencode models \u{2013}provider openrouter", ':').unwrap();
+        assert_eq!(
+            cmd,
+            ParsedCommand::HarnessSubcommand {
+                harness: HarnessKind::Opencode,
+                subcommand: OpencodeSubcommand::Models,
+                args: vec!["--provider".into(), "openrouter".into()],
+            }
+        );
     }
 }

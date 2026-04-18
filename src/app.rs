@@ -1128,29 +1128,31 @@ impl App {
                     .await;
                     return;
                 }
-                let reply = match self
-                    .opencode
-                    .run_subcommand(subcommand.clone(), &args)
-                    .await
-                {
-                    Ok(out) if out.is_empty() => {
-                        format!("opencode {:?}: (no output)", subcommand)
+                match self.opencode.run_subcommand(subcommand, args).await {
+                    Ok(event_rx) => {
+                        let hctx = HarnessContext {
+                            ctx: &msg.reply_context,
+                            telegram: self.telegram.as_deref(),
+                            slack: self.slack.as_deref(),
+                            discord: self.discord.as_deref(),
+                            schema_registry: &self.schema_registry,
+                            delivery_queue: &self.delivery_queue,
+                            webhook_client: &self.webhook_client,
+                            stream_tx: &self.stream_tx,
+                        };
+                        // Subcommands don't create sessions and don't emit ambient
+                        // HarnessStarted/Finished — drive_harness still works fine;
+                        // we just ignore the session_id return value.
+                        let _ = drive_harness(event_rx, &hctx).await;
                     }
-                    Ok(out) => {
-                        const MAX: usize = 3000;
-                        if out.len() > MAX {
-                            let truncated: String = out.chars().take(MAX).collect();
-                            format!(
-                                "```\n{}\n```\n… (truncated; run in terminal for full output)",
-                                truncated
-                            )
-                        } else {
-                            format!("```\n{}\n```", out)
-                        }
+                    Err(e) => {
+                        self.send_error(
+                            &msg.reply_context,
+                            &format!("opencode subcommand setup failed: {}", e),
+                        )
+                        .await;
                     }
-                    Err(e) => format!("opencode error: {}", e),
-                };
-                self.send_reply(&msg.reply_context, &reply).await;
+                }
             }
             ParsedCommand::ShellCommand { cmd } => {
                 // Snapshot pane before command so we can diff afterward

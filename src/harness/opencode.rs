@@ -313,84 +313,212 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
+/// Build the argv for a subcommand, mapping user-friendly aliases to the
+/// native opencode forms. Pure function — no I/O, fully testable.
+///
+/// - `Sessions` → `["session", "list", ...]`
+/// - `Providers` → `["auth", "list", ...]`
+/// - Everything else → `[<sub_name>, ...]`
+fn build_subcommand_argv(sub: &OpencodeSubcommand, extra_args: &[String]) -> Vec<String> {
+    let mut argv: Vec<String> = match sub {
+        OpencodeSubcommand::Models => vec!["models".into()],
+        OpencodeSubcommand::Stats => vec!["stats".into()],
+        OpencodeSubcommand::Sessions => vec!["session".into(), "list".into()],
+        OpencodeSubcommand::Providers => vec!["auth".into(), "list".into()],
+        OpencodeSubcommand::Export => vec!["export".into()],
+    };
+    argv.extend(extra_args.iter().cloned());
+    argv
+}
+
+/// Human-readable display name for a subcommand, used in empty-output messages.
+fn sub_display_name(sub: &OpencodeSubcommand) -> &'static str {
+    match sub {
+        OpencodeSubcommand::Models => "models",
+        OpencodeSubcommand::Stats => "stats",
+        OpencodeSubcommand::Sessions => "session list",
+        OpencodeSubcommand::Providers => "auth list",
+        OpencodeSubcommand::Export => "export",
+    }
+}
+
+/// Format a panic payload into a human-readable error string.
+fn format_panic_message(info: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = info.downcast_ref::<&str>() {
+        format!("OpenCode: internal panic: {}", s)
+    } else if let Some(s) = info.downcast_ref::<String>() {
+        format!("OpenCode: internal panic: {}", s)
+    } else {
+        "OpenCode: internal panic (unknown)".to_string()
+    }
+}
+
+/// Async inner body: spawn child, wait for output, emit Text + Done (or Error + Done).
+/// Bounded by a 30s timeout. Emits Done unconditionally before returning.
+async fn run_subcommand_inner(
+    binary: PathBuf,
+    argv: Vec<String>,
+    sub: OpencodeSubcommand,
+    extra_args: Vec<String>,
+    event_tx: mpsc::Sender<HarnessEvent>,
+) {
+    // Determine the display name for error / empty-output messages before moving.
+    let sub_label = sub_display_name(&sub);
+
+    let mut cmd = Command::new(&binary);
+    cmd.args(&argv)
+        .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = if e.kind() == std::io::ErrorKind::NotFound {
+                format!(
+                    "opencode binary not found: {} (set [harness.opencode] binary_path or install opencode on PATH)",
+                    binary.display()
+                )
+            } else {
+                format!("opencode subcommand spawn failed: {}", e)
+            };
+            let _ = event_tx.send(HarnessEvent::Error(msg)).await;
+            let _ = event_tx
+                .send(HarnessEvent::Done {
+                    session_id: String::new(),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let out =
+        match tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
+            .await
+        {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                let _ = event_tx
+                    .send(HarnessEvent::Error(format!(
+                        "opencode {} wait failed: {}",
+                        sub_label, e
+                    )))
+                    .await;
+                let _ = event_tx
+                    .send(HarnessEvent::Done {
+                        session_id: String::new(),
+                    })
+                    .await;
+                return;
+            }
+            Err(_) => {
+                let _ = event_tx
+                    .send(HarnessEvent::Error(format!(
+                        "opencode {} timed out after 30s",
+                        sub_label
+                    )))
+                    .await;
+                let _ = event_tx
+                    .send(HarnessEvent::Done {
+                        session_id: String::new(),
+                    })
+                    .await;
+                return;
+            }
+        };
+
+    if !out.status.success() {
+        let stderr_trim = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let code = out
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".into());
+        let detail = if stderr_trim.is_empty() {
+            format!(
+                "opencode {} exited with status {} (no stderr)",
+                sub_label, code
+            )
+        } else {
+            format!(
+                "opencode {} exited with status {}: {}",
+                sub_label, code, stderr_trim
+            )
+        };
+        let _ = event_tx.send(HarnessEvent::Error(detail)).await;
+        let _ = event_tx
+            .send(HarnessEvent::Done {
+                session_id: String::new(),
+            })
+            .await;
+        return;
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stripped = strip_ansi(&stdout);
+    let stripped = stripped.trim();
+
+    let message = if stripped.is_empty() {
+        let arg_summary = if extra_args.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", extra_args.join(" "))
+        };
+        format!("opencode {}{}: no results", sub_label, arg_summary)
+    } else {
+        format!("```\n{}\n```", stripped)
+    };
+
+    let _ = event_tx.send(HarnessEvent::Text(message)).await;
+    let _ = event_tx
+        .send(HarnessEvent::Done {
+            session_id: String::new(),
+        })
+        .await;
+}
+
 impl OpencodeHarness {
-    /// Spawn `opencode <sub> <args>` with `NO_COLOR=1`, capture stdout, strip
-    /// ANSI escapes, return the trimmed string. Bounded by a 30s timeout.
-    /// stderr is captured and appended on non-zero exit as diagnostic context.
-    /// DOES NOT create a session or emit ambient events — subcommands are
-    /// one-shot queries, not prompts.
-    pub async fn run_subcommand(&self, sub: OpencodeSubcommand, args: &[String]) -> Result<String> {
+    /// Spawn `opencode <sub> <args>` and stream the output via HarnessEvents.
+    /// Returns a receiver immediately; the caller passes it to `drive_harness`
+    /// for delivery (same pattern as `run_prompt`).
+    ///
+    /// Emits exactly one of:
+    /// - `HarnessEvent::Text(fenced_stdout)` on success, followed by `Done`
+    /// - `HarnessEvent::Error(msg)` on any failure, followed by `Done`
+    ///
+    /// No ambient events (HarnessStarted/Finished) — subcommands are not
+    /// AI runs. No session id. `Done.session_id` is an empty string.
+    pub async fn run_subcommand(
+        &self,
+        sub: OpencodeSubcommand,
+        args: Vec<String>,
+    ) -> Result<mpsc::Receiver<HarnessEvent>> {
+        let (event_tx, event_rx) = mpsc::channel::<HarnessEvent>(32);
         let binary = self
             .config
             .binary_path
             .clone()
             .unwrap_or_else(|| PathBuf::from("opencode"));
 
-        let sub_name = match sub {
-            OpencodeSubcommand::Models => "models",
-            OpencodeSubcommand::Stats => "stats",
-            OpencodeSubcommand::Sessions => "session", // `opencode session list`
-            OpencodeSubcommand::Providers => "auth",   // `opencode auth list`
-            OpencodeSubcommand::Export => "export",
-        };
+        let argv = build_subcommand_argv(&sub, &args);
 
-        let mut argv: Vec<String> = vec![sub_name.into()];
-        // `sessions` and `providers` are user-friendly aliases; they both
-        // map to a `list` sub-subcommand.
-        if matches!(
-            sub,
-            OpencodeSubcommand::Sessions | OpencodeSubcommand::Providers
-        ) {
-            argv.push("list".into());
-        }
-        argv.extend(args.iter().cloned());
-
-        let mut cmd = Command::new(&binary);
-        cmd.args(&argv)
-            .env("NO_COLOR", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null())
-            .kill_on_drop(true);
-
-        let child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                anyhow::anyhow!("opencode binary not found: {}", binary.display())
-            } else {
-                anyhow::anyhow!("opencode subcommand spawn failed: {}", e)
+        tokio::spawn(async move {
+            let body = run_subcommand_inner(binary, argv, sub, args, event_tx.clone());
+            let result = AssertUnwindSafe(body).catch_unwind().await;
+            if let Err(panic_info) = result {
+                let msg = format_panic_message(&*panic_info);
+                let _ = event_tx.send(HarnessEvent::Error(msg)).await;
+                let _ = event_tx
+                    .send(HarnessEvent::Done {
+                        session_id: String::new(),
+                    })
+                    .await;
             }
-        })?;
+        });
 
-        let output_fut = child.wait_with_output();
-        let out = tokio::time::timeout(std::time::Duration::from_secs(30), output_fut)
-            .await
-            .map_err(|_| anyhow::anyhow!("opencode {} timed out after 30s", sub_name))?
-            .map_err(|e| anyhow::anyhow!("opencode {} wait failed: {}", sub_name, e))?;
-
-        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-        let stripped = strip_ansi(&stdout);
-        let stripped = stripped.trim();
-
-        if !out.status.success() {
-            let stderr_trim = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let code = out
-                .status
-                .code()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "signal".into());
-            return Err(anyhow::anyhow!(
-                "opencode {} exited with status {}: {}",
-                sub_name,
-                code,
-                if stderr_trim.is_empty() {
-                    stripped.to_string()
-                } else {
-                    stderr_trim
-                }
-            ));
-        }
-
-        Ok(stripped.to_string())
+        Ok(event_rx)
     }
 }
 
@@ -1388,6 +1516,45 @@ mod tests {
         assert!(pos("--fork") < pos("--continue"));
     }
 
+    // ── build_subcommand_argv ─────────────────────────────────────────────────
+
+    #[test]
+    fn build_subcommand_argv_models_no_args() {
+        let argv = build_subcommand_argv(&OpencodeSubcommand::Models, &[]);
+        assert_eq!(argv, vec!["models"]);
+    }
+
+    #[test]
+    fn build_subcommand_argv_models_with_provider() {
+        let argv = build_subcommand_argv(&OpencodeSubcommand::Models, &["openrouter".into()]);
+        assert_eq!(argv, vec!["models", "openrouter"]);
+    }
+
+    #[test]
+    fn build_subcommand_argv_sessions_maps_to_session_list() {
+        let argv = build_subcommand_argv(&OpencodeSubcommand::Sessions, &[]);
+        assert_eq!(argv, vec!["session", "list"]);
+    }
+
+    #[test]
+    fn build_subcommand_argv_providers_maps_to_auth_list() {
+        let argv = build_subcommand_argv(&OpencodeSubcommand::Providers, &[]);
+        assert_eq!(argv, vec!["auth", "list"]);
+    }
+
+    #[test]
+    fn build_subcommand_argv_stats_with_days_flag() {
+        let argv =
+            build_subcommand_argv(&OpencodeSubcommand::Stats, &["--days".into(), "7".into()]);
+        assert_eq!(argv, vec!["stats", "--days", "7"]);
+    }
+
+    #[test]
+    fn build_subcommand_argv_export_with_session_id() {
+        let argv = build_subcommand_argv(&OpencodeSubcommand::Export, &["ses_01HABCDEF".into()]);
+        assert_eq!(argv, vec!["export", "ses_01HABCDEF"]);
+    }
+
     // ── Gated subcommand integration test ────────────────────────────────────
 
     #[tokio::test]
@@ -1399,8 +1566,25 @@ mod tests {
         }
         let (tx, _rx) = broadcast::channel::<AmbientEvent>(8);
         let h = OpencodeHarness::new(OpencodeConfig::default(), tx);
-        let result = h.run_subcommand(OpencodeSubcommand::Models, &[]).await;
-        let output = result.expect("run_subcommand(models) should succeed");
+        let mut event_rx = h
+            .run_subcommand(OpencodeSubcommand::Models, vec![])
+            .await
+            .expect("run_subcommand(models) should succeed");
+
+        let mut output = String::new();
+        while let Some(ev) =
+            tokio::time::timeout(std::time::Duration::from_secs(30), event_rx.recv())
+                .await
+                .expect("timeout")
+        {
+            match ev {
+                HarnessEvent::Text(t) => output.push_str(&t),
+                HarnessEvent::Done { .. } => break,
+                HarnessEvent::Error(e) => panic!("subcommand error: {}", e),
+                _ => {}
+            }
+        }
+
         assert!(!output.is_empty(), "models output should be non-empty");
         let lower = output.to_lowercase();
         let has_provider = ["openrouter", "anthropic", "claude", "gpt", "openai"]
