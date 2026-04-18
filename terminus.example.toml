@@ -68,6 +68,16 @@ stayawake_on_battery = false
 # [harness]
 # max_named_sessions = 50
 
+# Opencode harness sidecar (absent-by-default). When configured, terminus
+# spawns the `opencode` CLI lazily on first use and routes `: opencode ...`
+# prompts to it.
+#
+# [harness.opencode]
+# binary_path = "/usr/local/bin/opencode"   # default: resolved via PATH
+# port = 4096                                # default: 4096
+# start_mode = "lazy"                        # "lazy" (default) | "eager" (v1: treated as lazy)
+# crash_policy = "error"                     # "error" (default) | "restart" (v1: treated as error)
+
 # ---------------------------------------------------------------------------
 # Structured Output (--schema)
 # ---------------------------------------------------------------------------

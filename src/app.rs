@@ -14,7 +14,8 @@ use crate::command::{CommandBlocklist, HarnessOptions, ParsedCommand};
 use crate::config::Config;
 use crate::delivery::{split_message, GapInfo, GapPrefixes, PendingBannerAcks};
 use crate::harness::claude::ClaudeHarness;
-use crate::harness::{drive_harness, Harness, HarnessContext, HarnessKind};
+use crate::harness::opencode::OpencodeHarness;
+use crate::harness::{build_session_key, drive_harness, Harness, HarnessContext, HarnessKind};
 use crate::power::types::PowerSignal;
 use crate::session::{self, SessionManager};
 use crate::socket::events::AmbientEvent;
@@ -94,6 +95,12 @@ pub struct App {
     /// `mark_clean_shutdown` so the worker can check between-jobs and break out
     /// of an active drain loop without waiting for the next await point.
     retry_worker_shutdown_flag: Arc<AtomicBool>,
+
+    // ── OpenCode harness (strong named reference for shutdown) ────────────────
+    /// Strong named reference to the opencode harness, held in parallel with
+    /// the boxed trait-object entry in `harnesses`.  Main-loop `ctrl_c` branch
+    /// calls `app.opencode.shutdown().await` before `mark_clean_shutdown`.
+    pub opencode: Arc<OpencodeHarness>,
 }
 
 impl App {
@@ -123,6 +130,18 @@ impl App {
         );
         let (stream_tx, _) = broadcast::channel::<StreamEvent>(256);
         let (ambient_tx, _) = broadcast::channel::<AmbientEvent>(512);
+
+        // Build the opencode harness with the ambient bus.
+        let opencode_cfg = config
+            .harness
+            .opencode
+            .clone()
+            .unwrap_or_default();
+        let opencode = Arc::new(OpencodeHarness::new(opencode_cfg, ambient_tx.clone()));
+        harnesses.insert(
+            HarnessKind::Opencode,
+            Box::new(Arc::clone(&opencode)) as Box<dyn Harness>,
+        );
 
         // Hydrate active chat sets from persisted state.
         let snapshot = store.snapshot();
@@ -165,6 +184,7 @@ impl App {
             ambient_tx,
             retry_worker_shutdown: Arc::clone(&retry_worker_shutdown),
             retry_worker_shutdown_flag: Arc::clone(&retry_worker_shutdown_flag),
+            opencode,
         };
 
         // Immediately mark state dirty in memory (sets last_clean_shutdown=false)
@@ -172,6 +192,13 @@ impl App {
         // debounce window fires) still triggers a restart banner on the next boot.
         app.store.apply(StateUpdate::MarkDirty);
         app.store.persist()?;
+
+        // Boot-time diagnostic for legacy-key tracking (Risk 7).
+        let legacy_keys = app.count_legacy_unprefixed_keys();
+        tracing::info!(
+            legacy_keys = legacy_keys,
+            "unprefixed legacy named-session keys remaining"
+        );
 
         // Spawn the retry worker with the broadcast sender's subscribe handle.
         // We subscribe once here; the worker holds its own receiver.
@@ -875,7 +902,7 @@ impl App {
                 // a subsequent `--resume foo`.
                 let mut named_notification: Option<String> = None;
                 if let Some(ref resume_name) = options.resume {
-                    match self.named_harness_sessions.get(resume_name) {
+                    match self.lookup_named_session(kind, resume_name) {
                         Some(entry) if !entry.session_id.is_empty() => {
                             named_notification =
                                 Some(format!("Resuming session '{}'", resume_name));
@@ -894,8 +921,7 @@ impl App {
                     }
                 } else if let Some(ref name) = options.name {
                     let is_resumable = self
-                        .named_harness_sessions
-                        .get(name)
+                        .lookup_named_session(kind, name)
                         .is_some_and(|e| !e.session_id.is_empty());
                     let primary = if is_resumable {
                         format!("Resuming existing session '{}'", name)
@@ -1202,6 +1228,33 @@ impl App {
         self.session_mgr.interrupt_foreground().await
     }
 
+    /// Look up a named harness session by `(kind, short_name)`.
+    ///
+    /// Tries the prefixed key (`{kind}:{name}`) first, then falls back to the
+    /// unprefixed legacy key for backwards compatibility.
+    ///
+    // TODO: remove legacy fallback — trigger: next minor release OR state-file
+    // shows zero unprefixed keys for 14 consecutive days, whichever first.
+    fn lookup_named_session(
+        &self,
+        kind: HarnessKind,
+        name: &str,
+    ) -> Option<&NamedSessionEntry> {
+        let prefixed = build_session_key(kind, name);
+        self.named_harness_sessions
+            .get(&prefixed)
+            .or_else(|| self.named_harness_sessions.get(name))
+    }
+
+    /// Count legacy unprefixed keys remaining in `named_harness_sessions`.
+    /// Used for boot-time diagnostics (Risk 7 tracking).
+    fn count_legacy_unprefixed_keys(&self) -> usize {
+        self.named_harness_sessions
+            .keys()
+            .filter(|k| !k.contains(':'))
+            .count()
+    }
+
     /// Evict the least-recently-used named session, returning its name.
     fn evict_lru_session(&mut self) -> Option<String> {
         let oldest = self
@@ -1267,7 +1320,7 @@ impl App {
 
         if let Some(ref resume_name) = options.resume {
             // --resume: strict lookup, error if not found (or has no session_id yet)
-            match self.named_harness_sessions.get(resume_name) {
+            match self.lookup_named_session(*kind, resume_name) {
                 Some(entry) if !entry.session_id.is_empty() => {
                     session_name = resume_name.clone();
                     resume_id = Some(entry.session_id.clone());
@@ -1289,8 +1342,7 @@ impl App {
         } else if let Some(ref name) = options.name {
             // --name: create-or-resume (upsert)
             if let Some(entry) = self
-                .named_harness_sessions
-                .get(name)
+                .lookup_named_session(*kind, name)
                 .filter(|e| !e.session_id.is_empty())
             {
                 session_name = name.clone();
@@ -1383,9 +1435,10 @@ impl App {
                     // fall back to the existing entry's id so that a zero-output
                     // resume still refreshes `last_used` (prevents the session
                     // from becoming a stale eviction target).
+                    // Read-side uses the fallback-aware lookup so an existing
+                    // legacy unprefixed entry is still honored until cleanup.
                     let effective_sid = session_id.or_else(|| {
-                        self.named_harness_sessions
-                            .get(&session_name)
+                        self.lookup_named_session(*kind, &session_name)
                             .map(|e| e.session_id.clone())
                             .filter(|s| !s.is_empty())
                     });
@@ -1396,9 +1449,13 @@ impl App {
                             last_used: Utc::now(),
                         };
 
+                        // Write-side ALWAYS uses prefixed keys. Post-migration,
+                        // organic writes migrate legacy entries to their prefixed form.
+                        let prefixed_key = build_session_key(*kind, &session_name);
+
                         // Evict LRU if at cap (before inserting, in case this is a new name)
                         let mut batch_ops: Vec<(String, Option<NamedSessionEntry>)> = Vec::new();
-                        if !self.named_harness_sessions.contains_key(&session_name)
+                        if !self.named_harness_sessions.contains_key(&prefixed_key)
                             && self.named_harness_sessions.len() >= self.max_named_sessions
                         {
                             if let Some(evicted) = self.evict_lru_session() {
@@ -1406,8 +1463,8 @@ impl App {
                             }
                         }
                         self.named_harness_sessions
-                            .insert(session_name.clone(), entry.clone());
-                        batch_ops.push((session_name, Some(entry)));
+                            .insert(prefixed_key.clone(), entry.clone());
+                        batch_ops.push((prefixed_key, Some(entry)));
 
                         // Atomic persist
                         if let Err(e) = self
@@ -1835,18 +1892,18 @@ patterns = []
         let (mut app, _state_rx) = make_app(dir.path());
 
         app.named_harness_sessions
-            .insert("new".into(), make_entry("sid-new", 5));
+            .insert("claude:new".into(), make_entry("sid-new", 5));
         app.named_harness_sessions
-            .insert("oldest".into(), make_entry("sid-old", 3600));
+            .insert("claude:oldest".into(), make_entry("sid-old", 3600));
         app.named_harness_sessions
-            .insert("middle".into(), make_entry("sid-mid", 300));
+            .insert("claude:middle".into(), make_entry("sid-mid", 300));
 
         let evicted = app.evict_lru_session();
-        assert_eq!(evicted.as_deref(), Some("oldest"));
+        assert_eq!(evicted.as_deref(), Some("claude:oldest"));
         assert_eq!(app.named_harness_sessions.len(), 2);
-        assert!(!app.named_harness_sessions.contains_key("oldest"));
-        assert!(app.named_harness_sessions.contains_key("new"));
-        assert!(app.named_harness_sessions.contains_key("middle"));
+        assert!(!app.named_harness_sessions.contains_key("claude:oldest"));
+        assert!(app.named_harness_sessions.contains_key("claude:new"));
+        assert!(app.named_harness_sessions.contains_key("claude:middle"));
     }
 
     #[tokio::test]
@@ -2147,6 +2204,57 @@ patterns = []
         assert!(
             entry.session_id.is_empty(),
             "zombie should have empty session_id as seeded"
+        );
+    }
+
+    // ─── Read-side legacy-key fallback tests (A3) ────────────────────────────
+
+    #[tokio::test]
+    async fn read_side_fallback_accepts_legacy_key() {
+        // A legacy unprefixed key (pre-migration) must be found when looking
+        // up with (HarnessKind::Claude, "auth") — the fallback reads bare "auth".
+        let dir = tempdir().unwrap();
+        let (mut app, _) = make_app(dir.path());
+
+        let entry = NamedSessionEntry {
+            session_id: "sid-legacy".into(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            last_used: Utc::now(),
+        };
+        // Insert with the OLD unprefixed key (simulates a pre-migration state file).
+        app.named_harness_sessions.insert("auth".into(), entry);
+
+        // Lookup with the new prefixed API — fallback must find the legacy entry.
+        let found = app.lookup_named_session(HarnessKind::Claude, "auth");
+        assert!(found.is_some(), "legacy key should be found via fallback");
+        assert_eq!(found.unwrap().session_id, "sid-legacy");
+    }
+
+    #[tokio::test]
+    async fn read_side_fallback_prefers_prefixed_key_over_legacy() {
+        // When both prefixed and legacy keys exist, the prefixed key wins.
+        let dir = tempdir().unwrap();
+        let (mut app, _) = make_app(dir.path());
+
+        let legacy = NamedSessionEntry {
+            session_id: "sid-legacy".into(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            last_used: Utc::now(),
+        };
+        let prefixed_entry = NamedSessionEntry {
+            session_id: "sid-prefixed".into(),
+            cwd: std::path::PathBuf::from("/tmp"),
+            last_used: Utc::now(),
+        };
+        app.named_harness_sessions.insert("auth".into(), legacy);
+        app.named_harness_sessions.insert("claude:auth".into(), prefixed_entry);
+
+        let found = app.lookup_named_session(HarnessKind::Claude, "auth");
+        assert!(found.is_some());
+        assert_eq!(
+            found.unwrap().session_id,
+            "sid-prefixed",
+            "prefixed key should win over legacy"
         );
     }
 

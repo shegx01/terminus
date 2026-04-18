@@ -2109,4 +2109,116 @@ mod tests {
         };
         assert!(!opts.is_empty());
     }
+
+    // ─── opencode harness parsing ────────────────────────────────────────────
+
+    #[test]
+    fn parse_opencode_name_and_prompt() {
+        // `: opencode --name foo hi there` parses to HarnessPrompt with
+        // harness=Opencode, name=Some("foo"), prompt="hi there".
+        let cmd = ParsedCommand::parse(": opencode --name foo hi there", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                prompt,
+                options,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.name.as_deref(), Some("foo"));
+                assert_eq!(prompt, "hi there");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_bare_prompt() {
+        let cmd = ParsedCommand::parse(": opencode write a haiku", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt { harness, prompt, options } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(prompt, "write a haiku");
+                assert!(options.name.is_none());
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_resume_flag() {
+        let cmd = ParsedCommand::parse(": opencode --resume auth what did you do?", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt { harness, options, prompt } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.resume.as_deref(), Some("auth"));
+                assert_eq!(prompt, "what did you do?");
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    /// `: opencode --name foo` (no prompt text) must parse successfully as a
+    /// `HarnessPrompt` with an empty prompt — same behavior as the Claude
+    /// equivalent, which lets `app.rs` decide how to handle the empty case.
+    #[test]
+    fn parse_opencode_name_without_prompt() {
+        let cmd = ParsedCommand::parse(": opencode --name foo", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                options,
+                prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.name.as_deref(), Some("foo"));
+                assert!(
+                    prompt.is_empty(),
+                    "name-only opencode prompt must be empty, got: {:?}",
+                    prompt
+                );
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    /// `: opencode --resume foo` (no prompt) mirrors the above.
+    #[test]
+    fn parse_opencode_resume_without_prompt() {
+        let cmd = ParsedCommand::parse(": opencode --resume foo", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                options,
+                prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Opencode);
+                assert_eq!(options.resume.as_deref(), Some("foo"));
+                assert!(
+                    prompt.is_empty(),
+                    "resume-only opencode prompt must be empty, got: {:?}",
+                    prompt
+                );
+            }
+            other => panic!("Expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    /// `--name` and `--resume` are mutually exclusive across all harnesses;
+    /// opencode must reject the combination with the same error shape the
+    /// Claude parser uses.
+    #[test]
+    fn parse_opencode_mutual_exclusion_rejected() {
+        let err = ParsedCommand::parse(": opencode --name foo --resume bar hi", ':').unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidHarnessOption(_)),
+            "expected InvalidHarnessOption, got: {:?}",
+            err
+        );
+        assert!(
+            err.to_string()
+                .contains("Cannot use both --name and --resume/--continue"),
+            "expected mutual-exclusion message, got: {}",
+            err
+        );
+    }
 }

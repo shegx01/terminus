@@ -151,6 +151,61 @@ Uses `claude-agent-sdk-rust` crate, not terminal scraping. Claude prompts spawn 
 
 **Breaking change:** The `-n` short flag was reassigned from `--max-turns` to `--name`. Use `-t` for `--max-turns` instead.
 
+### opencode integration
+
+Uses `opencode-client-sdk` crate (`opencode` sidecar process on `127.0.0.1:4096` by default), not an in-process SDK. The sidecar is lazy-started on first use and kept alive for the lifetime of terminus. Two modes:
+- One-shot: `: opencode <prompt>`
+- Interactive: `: opencode on` / `: opencode off` toggles plain text routing
+
+**Named sessions:** Same `--name` / `--resume` flags as Claude, with the same semantics. Session keys are internally prefixed as `opencode:{name}` (vs `claude:{name}`) to prevent cross-harness collisions.
+
+**Session key format:** `build_session_key(kind, name)` produces `{kind}:{name}` (e.g. `opencode:auth`, `claude:auth`). This allows `: claude --name foo` and `: opencode --name foo` to coexist independently.
+
+**Config:** Add an optional `[harness.opencode]` block to `terminus.toml`:
+```toml
+[harness.opencode]
+# binary_path = "/opt/homebrew/bin/opencode"  # default: resolved via PATH
+# port = 4096                                  # default: 4096
+# start_mode = "lazy"                          # default: "lazy" ("eager" accepted but behaves as lazy in v1)
+# crash_policy = "error"                       # default: "error" (error + respawn-next-prompt)
+```
+
+**Sidecar lifecycle:** Lazy start on first prompt. Readiness-polled via `GET /global/health` with exponential backoff (50ms–1s, 5s hard deadline). Cached after first successful probe — not re-probed per prompt.
+
+**1s progress indicator:** If sidecar cold-start takes more than 1 second, a "Starting opencode sidecar..." text is sent to chat before the response arrives.
+
+**Tool-use visibility:** opencode tool events arrive as `running` + `completed` SSE frames keyed by `callID`. The harness accumulates per-call state and emits exactly one `HarnessEvent::ToolUse` on the terminal transition (`Completed` or `Error`). `HarnessEvent::ToolUse` carries optional structured `input`/`output` fields (populated by opencode; Claude/Codex/Gemini pass `None`).
+
+**Ambient events:** `AmbientEvent::HarnessStarted { harness: "OpenCode", run_id }` fires at session creation; `AmbientEvent::HarnessFinished { harness: "OpenCode", run_id, status }` fires on stream Done/Error. Socket subscribers receive opencode lifecycle events with parity to Claude.
+
+**Shutdown ordering:** `app.opencode.shutdown()` fires in the `ctrl_c` branch AFTER `socket_cancel.cancel()` + socket drain AND BEFORE `app.mark_clean_shutdown()`. Bounded by 5s total timeout (inner 2s SIGTERM drain, then Drop sends SIGKILL). Guarantees `last_clean_shutdown=true` is persisted even if the sidecar hangs.
+
+**Session persistence:** Named sessions use `build_session_key(Opencode, name)` as the key in `terminus-state.json`. Legacy unprefixed keys (from before this feature) are readable via a read-side fallback — write-side always uses prefixed keys.
+
+**Legacy key removal timeline:** The `or_else(|| .get(name))` fallback at every read site is tagged `// TODO: remove legacy fallback`. Removal trigger: next minor release OR state file shows zero unprefixed keys for 14 consecutive days, whichever comes first. Boot-time log line reports the remaining count.
+
+**Operational errors:**
+- `opencode not on PATH` — binary not found and `binary_path` not configured.
+- `opencode binary at <path> not executable: <os error>` — `binary_path` configured but spawn fails.
+- `127.0.0.1:4096 in use, check for another opencode instance` — port collision.
+- `opencode sidecar died; session lost, re-run to start fresh` — mid-stream crash.
+
+**Deferred past v1:**
+- `HarnessEvent::StructuredOutput` not yet wired for opencode (SDK supports `OutputFormat::JsonSchema`).
+- Inbound attachments not yet forwarded to opencode (URL-based `FilePartInput`).
+- `eager` start_mode accepted in config but falls back to lazy with a `tracing::warn`.
+- Legacy unprefixed session-key fallback removal — see timeline above.
+- Auto-pick free port when 4096 is bound (spec Non-Goal for v1).
+
+### Known limitations
+
+- **Hot-reload**: `[harness.opencode]` is read once at startup; changes (e.g. `binary_path`, `port`, `start_mode`, `crash_policy`) require a restart to take effect.
+- **Port reclaim**: if `127.0.0.1:4096` is held by a zombie opencode from a crashed previous terminus run, terminus v1 does not auto-reclaim it. The user must manually identify and kill the orphan (`lsof -ti :4096 | xargs kill`) before the next prompt will succeed.
+- **Mid-flight shutdown**: Ctrl-C during an in-flight prompt aborts the SSE stream bounded by shutdown timers (2s server.close + 5s outer in `main.rs`). Any LLM call already in progress may still be billed on the provider side without a response being delivered to the user.
+- **Sleep/wake**: if the host sleeps during a prompt, the opencode child is suspended along with the OS. On wake, the SSE stream typically errors and terminus surfaces `opencode sidecar died; session lost, re-run to start fresh`.
+- **State persist failure**: if `terminus-state.json` cannot be written (disk full, permissions), the in-memory `named_harness_sessions` is still updated — but on the next restart, `--resume <name>` will not find the session. This is a known systemic limitation across all harnesses, not opencode-specific.
+- **Version compatibility**: opencode server event-shape changes may produce events terminus cannot translate. When a prompt produces only unrecognised events (zero `Text`/`ToolUse` emissions), the harness surfaces `opencode: no recognized events received — opencode version may be incompatible` as a visible warning rather than empty output.
+
 ### Platform adapters
 
 All three implement `ChatPlatform` (async_trait). Auth is single-user: messages from non-authorized user IDs are silently dropped. Telegram uses manual `getUpdates` long-polling (not webhooks). Slack uses Socket Mode WebSocket with auto-reconnect. Discord uses the serenity crate with gateway intents `DIRECT_MESSAGES | GUILD_MESSAGES | MESSAGE_CONTENT` (privileged). Inbound Discord attachments (images/files sent by the user to the bot) are not currently processed -- only `msg.content` text is forwarded to the main loop. Telegram-parity for inbound attachments is a follow-up.
@@ -223,6 +278,7 @@ envelope and drain pending requests within `shutdown_drain_secs`.
 
 - **Single-user only.** Auth checks are per-platform (telegram_user_id, slack_user_id, discord_user_id in config).
 - **tmux must be on PATH.** All session operations shell out to `tmux`.
+- **opencode must be on PATH** (or `binary_path` configured) to use the opencode harness. Missing binary surfaces as a chat error on first `: opencode` prompt; terminus still boots.
 - **No shared mutable state.** The main loop owns all mutable state directly; platform adapters only send/receive through channels.
 - **Rate limiting is per-platform.** `edit_throttle_ms` config controls minimum gap between message edits to stay within Telegram/Slack API limits.
 - **Startup reconciliation.** On restart, surviving `term-*` tmux sessions are auto-reconnected. Chat binding is re-established on first user message (chat IDs are not persisted to disk).

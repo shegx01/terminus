@@ -2,6 +2,7 @@
 name = "terminus"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"  # required by opencode-client-sdk (edition 2024 dep)
 description = "Control terminal sessions from Telegram/Slack/Discord with structured-output automation"
 
 [workspace]
@@ -22,6 +23,7 @@ serde_json = "1"
 futures-util = "0.3"
 thiserror = "1"
 claude-agent-sdk-rust = { version = "1", default-features = false, features = ["tracing-support"] }
+opencode-client-sdk = { version = "1.2", default-features = false }
 openssl = { version = "0.10", features = ["vendored"] }
 uuid = { version = "1", features = ["v4"] }
 url = "2"

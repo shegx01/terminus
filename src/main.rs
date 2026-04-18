@@ -310,6 +310,15 @@ async fn main() -> Result<()> {
                         tracing::warn!("Socket drain timed out after {}s", socket_drain_secs);
                     }
                 }
+                // Shut down the opencode sidecar before marking clean shutdown.
+                // Bounded by 5s so a hung sidecar cannot delay mark_clean_shutdown
+                // and cause a spurious restart banner on the next boot.
+                if tokio::time::timeout(Duration::from_secs(5), app.opencode.shutdown())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("opencode sidecar shutdown timed out after 5s");
+                }
                 app.mark_clean_shutdown().await;
                 app.cleanup().await;
                 break;

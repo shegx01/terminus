@@ -212,6 +212,47 @@ fn default_queue_dir() -> PathBuf {
 pub struct HarnessConfig {
     /// Maximum named harness sessions before LRU eviction (default: 50).
     pub max_named_sessions: Option<usize>,
+    /// Optional opencode sidecar configuration. When absent, opencode runs
+    /// with all defaults (lazy start on 127.0.0.1:4096, binary resolved via
+    /// PATH, `error + respawn-on-next-prompt` crash policy).
+    #[serde(default)]
+    pub opencode: Option<OpencodeConfig>,
+}
+
+/// Optional configuration for the `opencode` harness sidecar.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OpencodeConfig {
+    /// Override path to the `opencode` binary. Default: resolved via `PATH`.
+    pub binary_path: Option<PathBuf>,
+    /// Override sidecar port. Default: 4096 (the opencode default).
+    pub port: Option<u16>,
+    /// When to start the sidecar. Default: `Lazy` (start on first use).
+    /// `Eager` is accepted but not yet wired up; behaves as `Lazy` in v1.
+    // TODO(opencode): wire eager start_mode dispatch.
+    pub start_mode: Option<OpencodeStartMode>,
+    /// What to do when the sidecar crashes mid-session. Default: `Error`
+    /// (surface the error to chat; next prompt respawns fresh).
+    // TODO(opencode): wire crash_policy=restart dispatch.
+    pub crash_policy: Option<OpencodeCrashPolicy>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OpencodeStartMode {
+    #[default]
+    Lazy,
+    Eager,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OpencodeCrashPolicy {
+    /// Surface the crash to chat; respawn the sidecar on the next prompt.
+    #[default]
+    Error,
+    /// Immediately respawn the sidecar on crash (not yet wired — v1 treats
+    /// this as `Error`).
+    Restart,
 }
 
 impl Default for StructuredOutputConfig {
@@ -462,6 +503,18 @@ impl Config {
         }
         if self.streaming.chunk_size == 0 {
             anyhow::bail!("streaming.chunk_size must be > 0");
+        }
+
+        // Validate harness.opencode.port if set.
+        if let Some(oc) = self.harness.opencode.as_ref() {
+            if let Some(port) = oc.port {
+                if port == 0 {
+                    anyhow::bail!(
+                        "[harness.opencode] port must be > 0 (0 would request an OS-assigned port, \
+                         which opencode does not support in v1)"
+                    );
+                }
+            }
         }
 
         // Validate schema entries.

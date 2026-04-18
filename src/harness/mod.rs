@@ -1,6 +1,7 @@
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod opencode;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -17,6 +18,7 @@ pub enum HarnessKind {
     Claude,
     Gemini,
     Codex,
+    Opencode,
 }
 
 impl HarnessKind {
@@ -26,6 +28,7 @@ impl HarnessKind {
             "claude" => Some(Self::Claude),
             "gemini" => Some(Self::Gemini),
             "codex" => Some(Self::Codex),
+            "opencode" => Some(Self::Opencode),
             _ => None,
         }
     }
@@ -35,8 +38,24 @@ impl HarnessKind {
             Self::Claude => "Claude",
             Self::Gemini => "Gemini",
             Self::Codex => "Codex",
+            Self::Opencode => "OpenCode",
         }
     }
+}
+
+/// Build a prefixed session key for storing a named harness session.
+///
+/// Keys are `{kind}:{name}` where kind is the lowercase harness identifier.
+/// This prevents cross-harness name collisions (e.g. `claude --name foo` and
+/// `opencode --name foo` can coexist as `claude:foo` and `opencode:foo`).
+pub fn build_session_key(kind: HarnessKind, name: &str) -> String {
+    let kind_prefix = match kind {
+        HarnessKind::Claude => "claude",
+        HarnessKind::Gemini => "gemini",
+        HarnessKind::Codex => "codex",
+        HarnessKind::Opencode => "opencode",
+    };
+    format!("{}:{}", kind_prefix, name)
 }
 
 /// Events streamed from a harness session to the chat delivery layer.
@@ -44,7 +63,16 @@ impl HarnessKind {
 #[derive(Debug, Clone)]
 pub enum HarnessEvent {
     /// Harness is using a tool (Read, Write, Edit, Bash, etc.)
-    ToolUse { tool: String, description: String },
+    ///
+    /// `input`/`output` are populated by harnesses that expose structured
+    /// tool IO (e.g. opencode); other harnesses pass `None` and rely on
+    /// `description` for a human-readable preview.
+    ToolUse {
+        tool: String,
+        description: String,
+        input: Option<String>,
+        output: Option<String>,
+    },
     /// Text from the harness response
     Text(String),
     /// A file produced by the harness (image, document, data file, etc.)
@@ -104,7 +132,21 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Format a tool use event for display in chat.
+#[allow(dead_code)] // public API used in tests and future callers
 pub fn format_tool_event(tool: &str, description: &str) -> String {
+    format_tool_event_full(tool, description, None, None)
+}
+
+/// Format a tool use event with optional structured `input`/`output` fields.
+///
+/// When both `input` and `output` are `Some`, renders `tool(input) → output`
+/// (with previews truncated). Otherwise falls back to `description`.
+pub fn format_tool_event_full(
+    tool: &str,
+    description: &str,
+    input: Option<&str>,
+    output: Option<&str>,
+) -> String {
     let icon = match tool {
         "Read" => "📖",
         "Write" => "📝",
@@ -117,6 +159,13 @@ pub fn format_tool_event(tool: &str, description: &str) -> String {
         "Thinking" => "🧠",
         _ => "🔧",
     };
+
+    // Prefer structured input/output when both are present.
+    if let (Some(inp), Some(outp)) = (input, output) {
+        let inp_preview = truncate(inp, 40);
+        let outp_preview = truncate(outp, 40);
+        return format!("{} {}({}) → {}", icon, tool, inp_preview, outp_preview);
+    }
 
     if description.is_empty() {
         format!("{} {}", icon, tool)
@@ -164,7 +213,12 @@ pub async fn drive_harness(
 
     while let Some(event) = event_rx.recv().await {
         match event {
-            HarnessEvent::ToolUse { tool, description } => {
+            HarnessEvent::ToolUse {
+                tool,
+                description,
+                input,
+                output,
+            } => {
                 got_any_output = true;
 
                 if last_tool_name.as_deref() == Some(&tool) {
@@ -177,7 +231,12 @@ pub async fn drive_harness(
                     }
                     consecutive_count = 0;
                     last_tool_name = Some(tool.clone());
-                    tool_lines.push(format_tool_event(&tool, &description));
+                    tool_lines.push(format_tool_event_full(
+                        &tool,
+                        &description,
+                        input.as_deref(),
+                        output.as_deref(),
+                    ));
                 }
 
                 // Flush batch every 3s or every 5 distinct tool lines
@@ -547,6 +606,60 @@ pub(crate) fn split_message(text: &str, max_len: usize) -> Vec<String> {
 mod tests {
     use super::*;
 
+    // ── HarnessKind ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn harness_kind_from_str_opencode_returns_opencode() {
+        assert_eq!(HarnessKind::from_str("opencode"), Some(HarnessKind::Opencode));
+        assert_eq!(HarnessKind::from_str("OpenCode"), Some(HarnessKind::Opencode));
+        assert_eq!(HarnessKind::from_str("OPENCODE"), Some(HarnessKind::Opencode));
+    }
+
+    #[test]
+    fn harness_kind_name_opencode_returns_opencode_pascal() {
+        assert_eq!(HarnessKind::Opencode.name(), "OpenCode");
+    }
+
+    #[test]
+    fn harness_kind_from_str_claude_roundtrip() {
+        let kind = HarnessKind::from_str("claude").expect("claude must parse");
+        assert_eq!(kind.name(), "Claude");
+    }
+
+    #[test]
+    fn harness_kind_from_str_unknown_returns_none() {
+        assert_eq!(HarnessKind::from_str("copilot"), None);
+    }
+
+    // ── build_session_key ────────────────────────────────────────────────────
+
+    #[test]
+    fn build_session_key_claude_foo_returns_prefixed() {
+        assert_eq!(build_session_key(HarnessKind::Claude, "foo"), "claude:foo");
+    }
+
+    #[test]
+    fn build_session_key_opencode_foo_returns_prefixed() {
+        assert_eq!(
+            build_session_key(HarnessKind::Opencode, "foo"),
+            "opencode:foo"
+        );
+    }
+
+    #[test]
+    fn build_session_key_gemini_codex_coverage() {
+        assert_eq!(build_session_key(HarnessKind::Gemini, "x"), "gemini:x");
+        assert_eq!(build_session_key(HarnessKind::Codex, "x"), "codex:x");
+    }
+
+    #[test]
+    fn build_session_key_no_collision_across_kinds() {
+        // Cross-kind no-collision: same short name yields distinct prefixed keys.
+        let k_claude = build_session_key(HarnessKind::Claude, "foo");
+        let k_opencode = build_session_key(HarnessKind::Opencode, "foo");
+        assert_ne!(k_claude, k_opencode);
+    }
+
     // ── format_tool_event ────────────────────────────────────────────────────
 
     #[test]
@@ -555,6 +668,23 @@ mod tests {
         assert!(result.contains("📖"), "expected book icon");
         assert!(result.contains("Read"), "expected tool name");
         assert!(result.contains("file.rs"), "expected description");
+    }
+
+    #[test]
+    fn format_tool_event_full_with_input_output_prefers_structured() {
+        let result = format_tool_event_full("Bash", "ignored", Some("ls -la"), Some("total 42"));
+        assert!(result.contains("ls -la"), "expected input preview");
+        assert!(result.contains("total 42"), "expected output preview");
+        assert!(!result.contains("ignored"), "description should be ignored when structured fields present");
+    }
+
+    #[test]
+    fn format_tool_event_full_falls_back_to_description_when_only_input() {
+        let result = format_tool_event_full("Bash", "raw description", Some("ls"), None);
+        assert!(
+            result.contains("raw description"),
+            "should fall back to description when output is None"
+        );
     }
 
     #[test]
