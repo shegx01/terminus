@@ -28,7 +28,9 @@
 //! Run with `TERMINUS_HAS_OPENCODE=1 cargo test -- --ignored`. See
 //! `docs/integration-tests.md` for preconditions.
 
-use super::{build_session_key, Harness, HarnessEvent, HarnessKind};
+#[cfg(test)]
+use super::build_session_key;
+use super::{Harness, HarnessEvent, HarnessKind};
 use crate::chat_adapters::Attachment;
 use crate::command::{HarnessOptions, OpencodeSubcommand};
 use crate::config::OpencodeConfig;
@@ -102,7 +104,8 @@ impl Harness for OpencodeHarness {
         if options.schema.is_some() {
             let _ = event_tx
                 .send(HarnessEvent::Error(
-                    "opencode does not support --schema; use the claude harness for structured output".into(),
+                    "opencode does not support --schema. Try: `: claude --schema=<name> <prompt>`"
+                        .into(),
                 ))
                 .await;
             let _ = event_tx
@@ -194,13 +197,7 @@ impl Harness for OpencodeHarness {
             let status = match result {
                 Ok(()) => "ok",
                 Err(panic_info) => {
-                    let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                        format!("OpenCode: internal panic: {}", s)
-                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                        format!("OpenCode: internal panic: {}", s)
-                    } else {
-                        "OpenCode: internal panic (unknown)".to_string()
-                    };
+                    let msg = format_panic_message(&*panic_info);
                     let _ = event_tx.send(HarnessEvent::Error(msg)).await;
                     "error"
                 }
@@ -421,11 +418,11 @@ fn sub_display_name(sub: &OpencodeSubcommand) -> &'static str {
 /// Format a panic payload into a human-readable error string.
 fn format_panic_message(info: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = info.downcast_ref::<&str>() {
-        format!("OpenCode: internal panic: {}", s)
+        format!("opencode: internal panic: {}", s)
     } else if let Some(s) = info.downcast_ref::<String>() {
-        format!("OpenCode: internal panic: {}", s)
+        format!("opencode: internal panic: {}", s)
     } else {
-        "OpenCode: internal panic (unknown)".to_string()
+        "opencode: internal panic (unknown)".to_string()
     }
 }
 
@@ -643,11 +640,11 @@ async fn run_opencode_inner(
         Err(e) => {
             let msg = if e.kind() == std::io::ErrorKind::NotFound {
                 format!(
-                    "OpenCode binary not found: {} (set [harness.opencode] binary_path or install opencode on PATH)",
+                    "opencode binary not found: {} (set [harness.opencode] binary_path or install opencode on PATH)",
                     binary.display()
                 )
             } else {
-                format!("OpenCode spawn failed: {}", e)
+                format!("opencode spawn failed: {}", e)
             };
             let _ = event_tx.send(HarnessEvent::Error(msg)).await;
             return;
@@ -659,7 +656,7 @@ async fn run_opencode_inner(
         None => {
             let _ = event_tx
                 .send(HarnessEvent::Error(
-                    "OpenCode: stdout pipe missing".to_string(),
+                    "opencode: stdout pipe missing".to_string(),
                 ))
                 .await;
             let _ = child.kill().await;
@@ -672,6 +669,8 @@ async fn run_opencode_inner(
     let mut captured_session_id: Option<String> = None;
     let mut saw_recognized = false;
     let mut saw_unknown = false;
+    let mut saw_schema_mismatch = false;
+    let mut first_unknown_logged = false;
     // Step counter for multi-step agentic flows.
     // Incremented on step_start, decremented on step_finish.
     // We break only when open_steps <= 0 AND at least one step_finish arrived.
@@ -691,14 +690,14 @@ async fn run_opencode_inner(
             Ok(Ok(None)) => break, // EOF
             Ok(Err(e)) => {
                 let _ = event_tx
-                    .send(HarnessEvent::Error(format!("OpenCode stdout read: {}", e)))
+                    .send(HarnessEvent::Error(format!("opencode: stdout read: {}", e)))
                     .await;
                 break;
             }
             Err(_) => {
                 let _ = event_tx
                     .send(HarnessEvent::Error(
-                        "OpenCode: no output for 5 minutes — killing subprocess".to_string(),
+                        "opencode: no output for 5 minutes — killing subprocess".to_string(),
                     ))
                     .await;
                 let _ = child.kill().await;
@@ -728,18 +727,20 @@ async fn run_opencode_inner(
 
         match translate_event(&value) {
             Some(translated) => {
-                saw_recognized = true;
                 for ev in translated {
                     match ev {
                         TranslatedEvent::StepStart => {
+                            saw_recognized = true;
                             open_steps += 1;
                         }
                         TranslatedEvent::Text(t) => {
+                            saw_recognized = true;
                             if !t.is_empty() {
                                 let _ = event_tx.send(HarnessEvent::Text(t)).await;
                             }
                         }
                         TranslatedEvent::StepFinish => {
+                            saw_recognized = true;
                             open_steps -= 1;
                             received_any_finish = true;
                         }
@@ -749,6 +750,7 @@ async fn run_opencode_inner(
                             input,
                             output,
                         } => {
+                            saw_recognized = true;
                             let _ = event_tx
                                 .send(HarnessEvent::ToolUse {
                                     tool,
@@ -757,6 +759,17 @@ async fn run_opencode_inner(
                                     output,
                                 })
                                 .await;
+                        }
+                        TranslatedEvent::SchemaMismatch {
+                            event_type,
+                            missing_field,
+                        } => {
+                            saw_schema_mismatch = true;
+                            tracing::warn!(
+                                event_type = %event_type,
+                                missing_field = %missing_field,
+                                "opencode event schema mismatch — update terminus"
+                            );
                         }
                     }
                 }
@@ -772,7 +785,15 @@ async fn run_opencode_inner(
                 // Unknown event type — log for diagnostics.
                 let ty = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
                 saw_unknown = true;
-                tracing::debug!("opencode: unknown event type `{}`", ty);
+                if !first_unknown_logged {
+                    tracing::warn!(
+                        event_type = ty,
+                        "opencode emitted an unrecognized event type; version drift possible"
+                    );
+                    first_unknown_logged = true;
+                } else {
+                    tracing::debug!("opencode: unknown event type `{}`", ty);
+                }
             }
         }
     }
@@ -809,9 +830,9 @@ async fn run_opencode_inner(
                 .unwrap_or_else(|| "signal".to_string());
             let sanitized = sanitize_stderr(&stderr_raw);
             let detail = if sanitized.is_empty() {
-                format!("OpenCode exited with status {} (no stderr)", code)
+                format!("opencode exited with status {} (no stderr)", code)
             } else {
-                format!("OpenCode exited with status {}: {}", code, sanitized)
+                format!("opencode exited with status {}: {}", code, sanitized)
             };
             let _ = event_tx.send(HarnessEvent::Error(detail)).await;
         }
@@ -821,11 +842,14 @@ async fn run_opencode_inner(
     // signal so the user doesn't see silence. Unknown-but-no-recognized is
     // the most likely version-drift signature.
     if !saw_recognized {
-        let msg = if saw_unknown {
-            "OpenCode: no recognized events received (version drift — check `opencode --version`)"
+        let msg = if saw_schema_mismatch {
+            "opencode: event schema mismatch (version drift — check `opencode --version`)"
+                .to_string()
+        } else if saw_unknown {
+            "opencode: no recognized events received (version drift — check `opencode --version`)"
                 .to_string()
         } else {
-            "OpenCode: no response content".to_string()
+            "opencode: no response content".to_string()
         };
         let _ = event_tx.send(HarnessEvent::Text(msg)).await;
     }
@@ -857,10 +881,17 @@ pub(crate) fn translate_event(event: &serde_json::Value) -> Option<Vec<Translate
     let ty = event.get("type").and_then(|t| t.as_str())?;
     match ty {
         "text" => {
-            let text = event
+            let Some(text) = event
                 .get("part")
                 .and_then(|p| p.get("text"))
-                .and_then(|t| t.as_str())?;
+                .and_then(|t| t.as_str())
+            else {
+                // Recognized event type but required field missing — schema drift.
+                return Some(vec![TranslatedEvent::SchemaMismatch {
+                    event_type: "text".into(),
+                    missing_field: "part.text".into(),
+                }]);
+            };
             if text.is_empty() {
                 Some(Vec::new())
             } else {
@@ -870,9 +901,25 @@ pub(crate) fn translate_event(event: &serde_json::Value) -> Option<Vec<Translate
         "step_start" => Some(vec![TranslatedEvent::StepStart]),
         "step_finish" => Some(vec![TranslatedEvent::StepFinish]),
         "tool_use" => {
-            let part = event.get("part")?;
-            let tool = part.get("tool").and_then(|v| v.as_str())?.to_string();
-            let state = part.get("state")?;
+            let Some(part) = event.get("part") else {
+                return Some(vec![TranslatedEvent::SchemaMismatch {
+                    event_type: "tool_use".into(),
+                    missing_field: "part".into(),
+                }]);
+            };
+            let Some(tool) = part.get("tool").and_then(|v| v.as_str()) else {
+                return Some(vec![TranslatedEvent::SchemaMismatch {
+                    event_type: "tool_use".into(),
+                    missing_field: "part.tool".into(),
+                }]);
+            };
+            let tool = tool.to_string();
+            let Some(state) = part.get("state") else {
+                return Some(vec![TranslatedEvent::SchemaMismatch {
+                    event_type: "tool_use".into(),
+                    missing_field: "part.state".into(),
+                }]);
+            };
             let status = state.get("status").and_then(|v| v.as_str()).unwrap_or("");
             let title = state
                 .get("title")
@@ -952,18 +999,22 @@ pub(crate) enum TranslatedEvent {
         input: Option<String>,
         output: Option<String>,
     },
-}
-
-#[allow(dead_code)]
-/// Build the `{kind}:{name}` prefixed state key for an opencode named session.
-/// Exposed for parity with the App-layer lookups.
-pub(crate) fn session_key(name: &str) -> String {
-    build_session_key(HarnessKind::Opencode, name)
+    /// A recognized event type was received but a required field was absent.
+    /// Indicates schema drift (e.g. opencode renamed `part.text` → `part.content`).
+    SchemaMismatch {
+        event_type: String,
+        missing_field: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build the `{kind}:{name}` prefixed state key for an opencode named session.
+    fn session_key(name: &str) -> String {
+        build_session_key(HarnessKind::Opencode, name)
+    }
 
     fn empty_harness() -> OpencodeHarness {
         OpencodeHarness::new_with_config(OpencodeConfig::default())
@@ -1088,6 +1139,7 @@ mod tests {
                                 })
                                 .await;
                         }
+                        TranslatedEvent::SchemaMismatch { .. } => {}
                     }
                 }
             }
@@ -1225,8 +1277,8 @@ mod tests {
     }
 
     #[test]
-    fn translate_event_tool_use_missing_state_returns_none() {
-        // Malformed: part has no `state` key
+    fn translate_event_tool_use_missing_state_returns_schema_mismatch() {
+        // Malformed: part has no `state` key — recognized event type, missing field.
         let ev = serde_json::json!({
             "type": "tool_use",
             "sessionID": "ses_abc",
@@ -1234,10 +1286,77 @@ mod tests {
                 "tool": "bash"
             }
         });
-        assert!(
-            translate_event(&ev).is_none(),
-            "missing state should return None"
-        );
+        let out = translate_event(&ev).expect("should return SchemaMismatch, not None");
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            TranslatedEvent::SchemaMismatch {
+                event_type,
+                missing_field,
+            } => {
+                assert_eq!(event_type, "tool_use");
+                assert!(
+                    missing_field.contains("state"),
+                    "missing_field should mention state, got: {}",
+                    missing_field
+                );
+            }
+            other => panic!("expected SchemaMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_event_text_missing_part_text_returns_schema_mismatch() {
+        // opencode renames part.text → part.content: field chain fails on `text`.
+        let ev = serde_json::json!({
+            "type": "text",
+            "sessionID": "ses_1",
+            "part": {"content": "x"}
+        });
+        let out = translate_event(&ev).expect("should return SchemaMismatch, not None");
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            TranslatedEvent::SchemaMismatch {
+                event_type,
+                missing_field,
+            } => {
+                assert_eq!(event_type, "text");
+                assert!(
+                    missing_field.contains("part.text"),
+                    "missing_field should mention part.text, got: {}",
+                    missing_field
+                );
+            }
+            other => panic!("expected SchemaMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_event_tool_use_missing_tool_field_returns_schema_mismatch() {
+        // part exists but no `tool` field — should return SchemaMismatch.
+        let ev = serde_json::json!({
+            "type": "tool_use",
+            "sessionID": "ses_abc",
+            "part": {
+                "name": "bash",
+                "state": {"status": "completed"}
+            }
+        });
+        let out = translate_event(&ev).expect("should return SchemaMismatch, not None");
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            TranslatedEvent::SchemaMismatch {
+                event_type,
+                missing_field,
+            } => {
+                assert_eq!(event_type, "tool_use");
+                assert!(
+                    missing_field.contains("tool"),
+                    "missing_field should mention tool, got: {}",
+                    missing_field
+                );
+            }
+            other => panic!("expected SchemaMismatch, got {:?}", other),
+        }
     }
 
     // ── build_session_key / session_key ──────────────────────────────────────
@@ -1286,8 +1405,8 @@ mod tests {
         match first {
             HarnessEvent::Error(msg) => {
                 assert!(
-                    msg.contains("schema") && msg.contains("claude"),
-                    "error must mention schema + claude fallback, got: {}",
+                    msg.contains("schema") && msg.contains("claude") && msg.contains("Try:"),
+                    "error must mention schema + claude fallback + Try hint, got: {}",
                     msg
                 );
             }
@@ -1431,7 +1550,7 @@ mod tests {
         let boxed: Box<dyn std::any::Any + Send> = Box::new("kaboom");
         assert_eq!(
             super::format_panic_message(&*boxed),
-            "OpenCode: internal panic: kaboom"
+            "opencode: internal panic: kaboom"
         );
     }
 
@@ -1440,7 +1559,7 @@ mod tests {
         let boxed: Box<dyn std::any::Any + Send> = Box::new(String::from("owned boom"));
         assert_eq!(
             super::format_panic_message(&*boxed),
-            "OpenCode: internal panic: owned boom"
+            "opencode: internal panic: owned boom"
         );
     }
 
@@ -1449,7 +1568,7 @@ mod tests {
         let boxed: Box<dyn std::any::Any + Send> = Box::new(42u32);
         assert_eq!(
             super::format_panic_message(&*boxed),
-            "OpenCode: internal panic (unknown)"
+            "opencode: internal panic (unknown)"
         );
     }
 

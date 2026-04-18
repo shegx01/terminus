@@ -335,7 +335,8 @@ impl ParsedCommand {
                     if options.is_empty() {
                         return Err(ParseError::InvalidHarnessOption(format!(
                             "`on` expects flags (e.g. `--name foo`, `--resume bar`). \
-                             For a one-shot prompt use `: claude {}` instead.",
+                             For a one-shot prompt use `: {} {}` instead.",
+                            kind.name().to_lowercase(),
                             trimmed
                         )));
                     }
@@ -2277,6 +2278,32 @@ mod tests {
         assert!(
             msg.contains(": claude hello there"),
             "error should suggest the one-shot form: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn parse_on_without_flags_opencode_names_opencode() {
+        // `: opencode on hello` must suggest `: opencode hello`, not `: claude hello`.
+        let err = ParsedCommand::parse(": opencode on hello", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(": opencode hello"),
+            "error should suggest `: opencode hello`, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn parse_on_without_flags_gemini_names_gemini() {
+        // `: gemini on hello` must suggest `: gemini hello`, not `: claude hello`.
+        let err = ParsedCommand::parse(": gemini on hello", ':').unwrap_err();
+        assert!(matches!(err, ParseError::InvalidHarnessOption(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains(": gemini hello"),
+            "error should suggest `: gemini hello`, got: {}",
             msg
         );
     }
