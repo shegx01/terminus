@@ -36,7 +36,7 @@ terminus gives you remote access to terminal sessions and AI harnesses from your
 | Discord   |  ✓   |          ✗          | Gateway; inbound attachments deferred |
 | WebSocket |  ✓   |          ✓          | Binary-frame upload; opt-in |
 
-\* Slack image attachments are downloaded and forwarded to AI harnesses; non-image file types (PDFs, documents, etc.) are not yet wired.
+\* Slack image attachments are downloaded and forwarded to AI harnesses; non-image file types (PDFs, documents, etc.) are not yet implemented.
 
 **AI harnesses** (the `: <name>` prefixed commands):
 
