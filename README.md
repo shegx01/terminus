@@ -44,11 +44,13 @@ terminus gives you remote access to terminal sessions and AI harnesses from your
 |----------|:--------:|:-----------:|:--------------:|:---------------:|:-----------------:|:-----------:|
 | claude   |    ✓     |      ✓      |       ✓        |        ✓        |         ✓         |      ✓      |
 | opencode |    ✓     |      ✓      |       ✓        |       ✓¹        |         ✗²        |      ✓      |
+| gemini   |    ✓     |      ✓      |       ✓        |       ✓³        |         ✗²        |      ✗⁴     |
 | codex    |   stub   |    stub     |      stub      |      stub       |       stub        |    stub     |
-| gemini   |   stub   |    stub     |      stub      |      stub       |       stub        |    stub     |
 
 ¹ Tool-use events are forwarded when opencode emits them; tool-enabled agents (e.g. "build") emit tool_use JSON events, others may not. Set `agent = "build"` in `[harness.opencode]` config or pass `--agent build` per-prompt
-² Opencode CLI has no schema-constrained output surface -- use the claude harness for `--schema` workflows
+² Opencode and gemini CLIs have no schema-constrained output surface -- use the claude harness for `--schema` workflows
+³ Tool-use events from gemini arrive as separate `tool_use` + `tool_result` frames linked by `tool_id`; terminus coalesces them into a single event with both input and output. Enable tool-using behavior with `--approval-mode yolo` (or `auto_edit` / `plan`)
+⁴ Inbound attachments (images / files) are rejected by the gemini harness with a chat-safe error rather than silently dropped; multimodal threading is a follow-up
 
 ---
 
@@ -192,6 +194,20 @@ Is this idiomatic Rust?
 
 **Full flag + subcommand reference:** [docs/opencode.md](docs/opencode.md)
 
+**Gemini** -- prompt Google's `gemini` CLI from chat, with tool-use events and named sessions:
+
+```
+: gemini explain this codebase
+: gemini on --name review --approval-mode yolo
+What does the auth module do?
+Can you also run the unit tests?
+: gemini off
+```
+
+Gemini CLI flags are mapped to their own idioms -- `-r latest` for bare `--continue`, `-m <alias>` for model (`pro` / `flash` / `flash-lite`), and `--approval-mode` (`default` / `auto_edit` / `yolo` / `plan`). Gemini's interactive subcommands (`update`, `mcp`, `extensions`, `skills`) are blocked from chat.
+
+**Full flag + event-schema reference:** [docs/gemini.md](docs/gemini.md)
+
 **Programmatic access** -- drive terminus from scripts, agents, or dashboards via WebSocket:
 
 ```bash
@@ -216,6 +232,7 @@ websocat ws://127.0.0.1:7645 -H "Authorization: Bearer tk_live_..."
 - **tmux** (for terminal sessions)
 - **Claude Code CLI** (for `: claude` commands -- `npm i -g @anthropic-ai/claude-code`)
 - **opencode** (optional, for `: opencode` commands -- see [OpenCode integration](#opencode-integration-optional))
+- **gemini** (optional, for `: gemini` commands -- see [Gemini integration](#gemini-integration-optional))
 - At least one of: Telegram bot token, Slack bot + app tokens, Discord bot token, or Socket API enabled
 
 ---
@@ -396,6 +413,32 @@ Optional overrides:
 **Blocked from chat** (run in your terminal instead): `acp`, `agent`, `attach`, `auth`, `debug`, `github`, `import`, `login`, `logout`, `mcp`, `serve`, `session`, `tui`, `uninstall`, `upgrade`, `web`. Terminus returns a clear error if you try these from chat. Note: `session list` / `session ls` and `auth list` / `auth ls` ARE supported as safe read-only aliases.
 
 See [docs/opencode.md](docs/opencode.md) for the full CLI reference.
+
+### Gemini integration (optional)
+
+Gemini runs as a subprocess -- terminus spawns `gemini -o stream-json [flags] <prompt>` per prompt and inherits gemini-cli's own defaults (auth, default model). No extra terminus config is required if `gemini` is on PATH and authenticated.
+
+Optional overrides:
+
+```toml
+[harness.gemini]
+# Override the gemini binary location (default: resolved via PATH)
+# binary_path = "/usr/local/bin/gemini"
+
+# Per-run model override. Aliases: "pro" | "flash" | "flash-lite"
+# model = "flash"
+
+# Per-run approval mode. Values: "default" | "auto_edit" | "yolo" | "plan"
+# approval_mode = "default"
+```
+
+**Requirements:** `gemini` on PATH, already authenticated via gemini-cli's own config / OAuth flow.
+
+**Blocked from chat** (all four are interactive or destructive; run in your terminal instead): `update`, `mcp`, `extensions`, `skills`. No chat-safe gemini subcommands are shipped yet -- a `--list-sessions` passthrough is a planned follow-up.
+
+**Per-prompt flags:** `--name`, `--resume`, `--continue` (named or bare), `--model` / `-m`, `--approval-mode`. Opencode-only flags (`--title`, `--share`, `--pure`, `--fork`) are not supported by gemini and return a parse error. Attachments (images / files) are rejected with a chat-safe error -- multimodal threading is a follow-up.
+
+See [docs/gemini.md](docs/gemini.md) for the full CLI reference, event schema, error table, and functionality matrix.
 
 ### Multiple platforms
 
@@ -591,7 +634,7 @@ Use `--resume` when you know the session exists and want to catch typos. `--cont
 - On resume, the stored working directory is passed to the SDK for context
 - Sessions are LRU-evicted when the index exceeds `max_named_sessions` (default 50, configurable in `[harness]` section)
 - `--name` and `--resume` are mutually exclusive
-- Only works with harnesses that support resume (currently Claude and opencode)
+- Only works with harnesses that support resume (currently Claude, opencode, and Gemini)
 
 **Breaking change:** `-n` was previously the short flag for `--max-turns`. It now means `--name`. Use `-t` for `--max-turns`.
 
@@ -1066,7 +1109,7 @@ src/
     mod.rs             Harness trait, event types, streaming driver
     claude.rs          Claude Code SDK integration (streaming, images, file delivery)
     opencode.rs        OpenCode CLI subprocess harness (JSON event stream, multi-step)
-    gemini.rs          Gemini harness (planned)
+    gemini.rs          Gemini CLI subprocess harness (stream-json, tool-pairing buffer)
     codex.rs           Codex harness (planned)
   chat_adapters/
     mod.rs             ChatPlatform trait + Attachment type
@@ -1105,7 +1148,7 @@ cmd_tx (mpsc) ──────────> tokio::select! core loop (main.rs)
                             └── Socket per-connection tasks (subscription filtering)
 ```
 
-The harness system is extensible via the `Harness` trait. Claude and OpenCode are fully implemented; Gemini and Codex have stubs ready for future integration. Each harness supports streaming events (`ToolUse`, `Text`, `File`, `Done`, `Error`) and optional multi-turn session resume.
+The harness system is extensible via the `Harness` trait. Claude, OpenCode, and Gemini are fully implemented; Codex has a stub ready for future integration. Each harness supports streaming events (`ToolUse`, `Text`, `File`, `Done`, `Error`) and optional multi-turn session resume.
 
 ---
 
@@ -1163,6 +1206,12 @@ Images are only supported in harness mode. Enter Claude mode first with `: claud
 <summary>OpenCode commands not working</summary>
 
 Opencode must be installed and authenticated: install from [opencode.ai](https://opencode.ai) and run `opencode auth login`. Verify with `opencode models` in your terminal. If terminus can't find it, set `binary_path` in `[harness.opencode]`. Blocked subcommands (auth login/logout, serve, web, etc.) must be run in your terminal, not via chat.
+</details>
+
+<details>
+<summary>Gemini commands not working</summary>
+
+Gemini CLI must be installed from [github.com/google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli) and already authenticated (via its own OAuth / config flow -- terminus does not proxy credentials). Verify with `gemini --help` in your terminal. If terminus can't find it, set `binary_path` in `[harness.gemini]`. Interactive gemini subcommands (`update`, `mcp`, `extensions`, `skills`) are blocked from chat -- run them in your terminal. Use `--approval-mode yolo` (per-prompt or in config) if you want gemini to execute tools without prompting.
 </details>
 
 <details>

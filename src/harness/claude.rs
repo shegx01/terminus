@@ -22,6 +22,12 @@ pub struct ClaudeHarness {
     schema_registry: Arc<SchemaRegistry>,
 }
 
+impl Default for ClaudeHarness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClaudeHarness {
     pub fn new() -> Self {
         Self {

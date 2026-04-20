@@ -22,7 +22,11 @@ pub enum HarnessKind {
 }
 
 impl HarnessKind {
-    /// Parse a harness name from user input (case-insensitive).
+    /// Parse a harness name from user input (case-insensitive). Returns
+    /// `None` on unknown names; deliberately uses `Option` rather than the
+    /// `FromStr` trait because callers treat unknown input as "not a harness"
+    /// and fall through to other parse paths rather than surfacing an error.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "claude" => Some(Self::Claude),

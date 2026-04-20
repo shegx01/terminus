@@ -37,7 +37,8 @@ src/
     claude.rs       Claude Code SDK integration (claude-agent-sdk-rust crate)
     opencode.rs     opencode CLI-subprocess harness; translate_event, sanitize_stderr
     codex.rs        Codex harness stub
-    gemini.rs       Gemini harness stub
+    gemini.rs       Gemini CLI-subprocess harness; translate_event, ToolPairingBuffer,
+                    sanitize_stderr
   chat_adapters/
     mod.rs          ChatPlatform trait (async_trait), IncomingMessage,
                     ReplyContext (with optional socket_reply_tx for socket-
@@ -149,7 +150,7 @@ Uses `claude-agent-sdk-rust` crate, not terminal scraping. Claude prompts spawn 
 - Session names follow the same rules as terminal session names (alphanumeric, hyphens, underscores, max 64 chars).
 - Both flags work in one-shot (`: claude --name auth fix bug`) and interactive (`: claude on --name auth`) modes.
 - `--name` and `--resume` are mutually exclusive.
-- Only works with harnesses that support resume (Claude and opencode).
+- Only works with harnesses that support resume (Claude, opencode, and Gemini).
 
 **Session persistence:** Named sessions persist across restarts. The session index (name -> session_id + working directory) is stored in `terminus-state.json` via StateStore. The Claude SDK persists conversation state in `.claude/`. On resume, the stored working directory is passed to the SDK.
 
@@ -201,6 +202,47 @@ chars. For long outputs, run the CLI in your terminal.
 - Cross-harness state-persist-failure (state file only persists one entry per
   key; the `{kind}:{name}` prefix scheme prevents collisions between harnesses
   but the underlying state-store write path is shared). Not opencode-specific.
+
+### Gemini integration
+
+Uses Google's `gemini` CLI (`github.com/google-gemini/gemini-cli`) — each
+prompt spawns `gemini -o stream-json [flags] <prompt>` as a short-lived child process
+with `kill_on_drop(true)`. Positional prompt (gemini-cli's `-p` is deprecated
+upstream), `-r <id>` resume (with `-r latest` as the bare `--continue` analog),
+`-m <model>` override, `--approval-mode <x>` from config.
+
+- Config is inherited from gemini-cli's own (auth, default model).
+- Session resume uses `-r <session_id>`. Terminus captures the first
+  `session_id` from the `init` event and persists the name → id mapping under
+  prefixed key `gemini:<name>` in `terminus-state.json`.
+- Event schema diverges from opencode: `tool_use` and `tool_result` are
+  **separate events linked by `tool_id`**. A `ToolPairingBuffer` coalesces
+  them into a single `HarnessEvent::ToolUse` with structured `input` + `output`.
+  Unpaired `tool_use` on stream close is flushed with `output: None`.
+- Ambient events: `HarnessStarted` / `HarnessFinished` at prompt boundaries.
+- No persistent sidecar, no port binding, no shutdown hook needed.
+
+Optional `[harness.gemini]` overrides (see `terminus.example.toml`):
+- `binary_path`: override the gemini CLI location (default: resolved via PATH)
+- `model`: pass `-m <value>` to `gemini` (aliases: `pro` | `flash` | `flash-lite`)
+- `approval_mode`: pass `--approval-mode <value>` (`default` | `auto_edit` | `yolo` | `plan`)
+
+**Supported subcommands from chat:** none shipped yet. Full reference: [docs/gemini.md](docs/gemini.md).
+
+**Blocked from chat** (chat-safe errors returned; run in terminal): `update`, `mcp`, `extensions`, `skills`.
+
+**Per-prompt flags** (`: gemini [flags] <prompt>`):
+- `--name <x>` / `--resume <x>` / `--continue <x>` — named session
+- `--continue` (bare) — continue the most recent gemini session (maps to `gemini -r latest`)
+- `--model <x>` (alias: `-m`) — model override; overrides `[harness.gemini] model` when passed per-prompt
+- `--approval-mode <x>` — overrides `[harness.gemini] approval_mode` per-prompt
+
+Full flag semantics, event schema, error table, and functionality matrix: [docs/gemini.md](docs/gemini.md).
+
+**Known limitations (gemini-specific):**
+- No chat-safe subcommand passthrough yet (e.g. `: gemini sessions` sends "sessions" as a prompt). `--list-sessions` surface is a follow-up.
+- Inbound attachments (images / files) are rejected with a chat-safe error rather than forwarded — multimodal threading is a follow-up.
+- `stats` from the terminal `result` event (tokens, duration, tool calls) is not surfaced to chat.
 
 ### Platform adapters
 

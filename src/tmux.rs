@@ -6,6 +6,12 @@ pub struct TmuxClient {
     session_prefix: String,
 }
 
+impl Default for TmuxClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TmuxClient {
     pub fn new() -> Self {
         Self {
