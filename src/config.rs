@@ -217,6 +217,12 @@ pub struct HarnessConfig {
     /// CLI config (default model, agent, provider, auth).
     #[serde(default)]
     pub opencode: Option<OpencodeConfig>,
+    /// Gemini CLI-subprocess harness configuration.  Optional — when absent,
+    /// the harness resolves `gemini` from PATH and inherits the user's own
+    /// CLI config.
+    #[serde(default)]
+    #[allow(dead_code)] // read once App wires GeminiHarness into the harness map
+    pub gemini: Option<GeminiConfig>,
 }
 
 /// Configuration for the Opencode CLI-subprocess harness.
@@ -233,6 +239,23 @@ pub struct OpencodeConfig {
     pub model: Option<String>,
     /// Optional agent override (e.g. `"build"`). Passed via `--agent`.
     pub agent: Option<String>,
+}
+
+/// Configuration for the Gemini CLI-subprocess harness.
+///
+/// All fields are optional. When a field is `None`, the corresponding CLI flag
+/// is omitted from `gemini ...` and the binary falls back to the user's own
+/// gemini-cli config defaults.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GeminiConfig {
+    /// Override path to the `gemini` binary. When `None`, resolves via PATH.
+    pub binary_path: Option<PathBuf>,
+    /// Optional model override (e.g. `"flash"`, `"flash-lite"`, `"pro"`).
+    /// Passed via `-m`.
+    pub model: Option<String>,
+    /// Optional approval mode (`default` | `auto_edit` | `yolo` | `plan`).
+    /// Passed via `--approval-mode`.
+    pub approval_mode: Option<String>,
 }
 
 impl Default for StructuredOutputConfig {
