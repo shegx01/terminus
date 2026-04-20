@@ -25,7 +25,7 @@ pub struct DeliveryJob {
 /// Disk-backed delivery queue under `<queue_dir>/`.
 ///
 /// Directory layout:
-/// ```
+/// ```text
 /// <queue_dir>/
 ///   tmp/       temporary files (write target before atomic rename)
 ///   pending/   durably enqueued jobs waiting for delivery

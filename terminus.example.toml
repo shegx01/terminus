@@ -61,9 +61,9 @@ stayawake_on_battery = false
 # ---------------------------------------------------------------------------
 # Named Harness Sessions
 # ---------------------------------------------------------------------------
-# Controls the maximum number of named sessions (Claude and opencode) (--name / --resume)
-# kept in the session index. When the cap is reached, the least-recently-used
-# session is evicted. Default: 50.
+# Controls the maximum number of named sessions (Claude, opencode, and Gemini)
+# (--name / --resume) kept in the session index. When the cap is reached, the
+# least-recently-used session is evicted. Default: 50.
 #
 # [harness]
 # max_named_sessions = 50
@@ -82,6 +82,22 @@ stayawake_on_battery = false
 #                                           # can also override per-prompt with --model / -m
 # agent = "build"                           # default: opencode's own default
 #                                           # can also override per-prompt with --agent
+
+# ---------------------------------------------------------------------------
+# gemini CLI harness overrides
+# ---------------------------------------------------------------------------
+# Optional: override gemini-cli settings for the Gemini harness.
+# If this entire block is omitted, terminus uses gemini-cli's own defaults
+# (auth, default model). The gemini binary must be on PATH unless
+# binary_path is explicitly set.
+#
+# [harness.gemini]
+# binary_path = "/usr/local/bin/gemini"     # default: resolved via PATH
+# model = "flash"                           # default: gemini-cli's own default
+#                                           # aliases: "pro" | "flash" | "flash-lite"
+#                                           # can also override per-prompt with --model / -m
+# approval_mode = "default"                 # default | auto_edit | yolo | plan
+#                                           # passed to gemini via --approval-mode
 
 # ---------------------------------------------------------------------------
 # Structured Output (--schema)

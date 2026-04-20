@@ -23,7 +23,7 @@
 //!
 //! ```json
 //! {"type":"init",        "session_id":"ses_…", "model":"…"}
-//! {"type":"message",     "role":"assistant", "content":"…", "delta":"…"}
+//! {"type":"message",     "role":"assistant", "content":"…", "delta":true}
 //! {"type":"tool_use",    "tool_id":"…", "tool_name":"…", "parameters":{…}}
 //! {"type":"tool_result", "tool_id":"…", "status":"success|error", "output":"…", "error":"…"}
 //! {"type":"error",       "severity":"warning|error", "message":"…"}
@@ -64,7 +64,6 @@ pub struct GeminiHarness {
 
 impl GeminiHarness {
     /// Construct a harness with the provided config and ambient-event sender.
-    #[allow(dead_code)]
     pub fn new(config: GeminiConfig, ambient_tx: broadcast::Sender<AmbientEvent>) -> Self {
         Self {
             config,
@@ -97,7 +96,7 @@ impl Harness for GeminiHarness {
     async fn run_prompt(
         &self,
         prompt: &str,
-        _attachments: &[Attachment],
+        attachments: &[Attachment],
         cwd: &Path,
         session_id: Option<&str>,
         options: &HarnessOptions,
@@ -121,6 +120,22 @@ impl Harness for GeminiHarness {
             return Ok(event_rx);
         }
 
+        // Attachments are not yet supported by this harness. Surface an error
+        // rather than silently dropping user-provided files.
+        if !attachments.is_empty() {
+            let _ = event_tx
+                .send(HarnessEvent::Error(
+                    "gemini: attachments are not yet supported — send text only".into(),
+                ))
+                .await;
+            let _ = event_tx
+                .send(HarnessEvent::Done {
+                    session_id: String::new(),
+                })
+                .await;
+            return Ok(event_rx);
+        }
+
         let binary: PathBuf = self
             .config
             .binary_path
@@ -130,7 +145,6 @@ impl Harness for GeminiHarness {
         let args = build_argv(prompt, session_id, options, &self.config);
 
         let cwd = cwd.to_path_buf();
-        let sessions = Arc::clone(&self.sessions);
         let ambient_tx = self.ambient_tx.clone();
         let run_id = ulid::Ulid::new().to_string();
 
@@ -147,8 +161,7 @@ impl Harness for GeminiHarness {
 
         let run_id_for_task = run_id.clone();
         tokio::spawn(async move {
-            let body =
-                run_gemini_inner(binary, args, cwd, event_tx.clone(), Arc::clone(&sessions));
+            let body = run_gemini_inner(binary, args, cwd, event_tx.clone());
             let result: std::result::Result<(), Box<dyn std::any::Any + Send>> =
                 AssertUnwindSafe(body).catch_unwind().await;
 
@@ -244,10 +257,12 @@ fn build_argv(
         args.push(m.clone());
     }
 
-    // Approval mode (config-level only for now — HarnessOptions has no
-    // dedicated field, so users who want per-prompt control set it in
-    // `[harness.gemini]`).
-    if let Some(ref a) = config.approval_mode {
+    // Approval mode: per-prompt options take precedence over static config.
+    let effective_approval = options
+        .approval_mode
+        .as_ref()
+        .or(config.approval_mode.as_ref());
+    if let Some(a) = effective_approval {
         args.push("--approval-mode".into());
         args.push(a.clone());
     }
@@ -260,68 +275,33 @@ fn build_argv(
     args
 }
 
-/// Strip ANSI escape sequences (CSI + simple OSC). Hand-rolled to avoid a new
-/// crate dep. Kept identical to opencode's implementation for consistency.
-#[allow(dead_code)]
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            if let Some(&next) = chars.peek() {
-                if next == '[' {
-                    chars.next();
-                    for cc in chars.by_ref() {
-                        if ('\x40'..='\x7e').contains(&cc) {
-                            break;
-                        }
-                    }
-                    continue;
-                } else if next == ']' {
-                    chars.next();
-                    while let Some(cc) = chars.next() {
-                        if cc == '\x07' {
-                            break;
-                        }
-                        if cc == '\x1b' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                    continue;
-                }
-            }
-            continue;
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// Sanitize a stderr string before forwarding it to chat. Kept pattern-for-
-/// pattern identical to opencode's implementation:
+/// pattern identical to opencode's implementation, with one deliberate
+/// divergence: redaction runs **before** the 500-char truncation so a
+/// sensitive path near the truncation boundary cannot leak a partial prefix.
 ///
-/// - Truncates to 500 chars (chat-friendly)
 /// - Redacts `KEY=value` env-var assignments
 /// - Redacts `/Users/<name>/...` and `/home/<name>/...` paths
+/// - Truncates the redacted result to 500 chars (chat-friendly)
 pub(crate) fn sanitize_stderr(s: &str) -> String {
-    let truncated: String = s.chars().take(500).collect();
-
-    let mut out = String::with_capacity(truncated.len());
-    let mut rest = truncated.as_str();
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
     while !rest.is_empty() {
         if let Some(pos) = rest.find('=') {
             let before = &rest[..pos];
+            // Include both upper and lower alpha in the key scan so lowercase
+            // env-var conventions (e.g. `gemini_api_key=...`) are caught too.
+            // False-positives on prose like `name=hello` are acceptable —
+            // redacting "hello" is visible-only, whereas missing a key leaks
+            // the user's own credentials to the chat log.
             let key_start = before
-                .rfind(|c: char| !c.is_ascii_uppercase() && !c.is_ascii_digit() && c != '_')
+                .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
                 .map(|i| i + 1)
                 .unwrap_or(0);
             let key = &before[key_start..];
             let is_env_key = !key.is_empty()
-                && key.starts_with(|c: char| c.is_ascii_uppercase())
-                && key
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+                && key.starts_with(|c: char| c.is_ascii_alphabetic())
+                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
 
             if is_env_key {
                 out.push_str(&rest[..key_start]);
@@ -365,7 +345,7 @@ pub(crate) fn sanitize_stderr(s: &str) -> String {
         }
     }
 
-    result
+    result.chars().take(500).collect()
 }
 
 fn format_panic_message(info: &(dyn std::any::Any + Send)) -> String {
@@ -388,7 +368,6 @@ async fn run_gemini_inner(
     args: Vec<String>,
     cwd: PathBuf,
     event_tx: mpsc::Sender<HarnessEvent>,
-    _sessions: Arc<StdMutex<HashMap<String, String>>>,
 ) {
     let mut cmd = Command::new(&binary);
     cmd.args(&args)
@@ -410,6 +389,11 @@ async fn run_gemini_inner(
                 format!("gemini spawn failed: {}", e)
             };
             let _ = event_tx.send(HarnessEvent::Error(msg)).await;
+            let _ = event_tx
+                .send(HarnessEvent::Done {
+                    session_id: String::new(),
+                })
+                .await;
             return;
         }
     };
@@ -423,6 +407,11 @@ async fn run_gemini_inner(
                 ))
                 .await;
             let _ = child.kill().await;
+            let _ = event_tx
+                .send(HarnessEvent::Done {
+                    session_id: String::new(),
+                })
+                .await;
             return;
         }
     };
@@ -435,11 +424,14 @@ async fn run_gemini_inner(
     let mut saw_schema_mismatch = false;
     let mut first_unknown_logged = false;
     let mut fatal_error: Option<String> = None;
-    let mut saw_terminal_result = false;
     let mut pairing = ToolPairingBuffer::new();
-    // Per-message assistant-delta accumulator. Reset at the top of each new
-    // `message` event whose delta is present; flushed on an atomic message or
-    // on the next non-message event.
+    // Per-turn assistant-text accumulator. Grows on streaming `message` events
+    // (where `delta: true`); flushed into a single `HarnessEvent::Text` on an
+    // atomic message (non-delta), on the next non-message event, at stream
+    // close, or when the buffer crosses `ASSISTANT_BUFFER_CAP` (resource-
+    // safety auto-flush against a pathological stream that never terminates
+    // a turn).
+    const ASSISTANT_BUFFER_CAP: usize = 4 * 1024 * 1024;
     let mut assistant_buffer: String = String::new();
 
     loop {
@@ -493,6 +485,15 @@ async fn run_gemini_inner(
                         TranslatedEvent::Text(t) => {
                             saw_recognized = true;
                             if !t.is_empty() {
+                                // Auto-flush before growing past the cap so
+                                // the buffer can't grow unboundedly from a
+                                // stream that never emits AssistantDone.
+                                if assistant_buffer.len() + t.len() > ASSISTANT_BUFFER_CAP
+                                    && !assistant_buffer.is_empty()
+                                {
+                                    let text = std::mem::take(&mut assistant_buffer);
+                                    let _ = event_tx.send(HarnessEvent::Text(text)).await;
+                                }
                                 assistant_buffer.push_str(&t);
                             }
                         }
@@ -524,7 +525,8 @@ async fn run_gemini_inner(
                             error,
                         } => {
                             saw_recognized = true;
-                            if let Some(paired) = pairing.on_result(&tool_id, success, output, error)
+                            if let Some(paired) =
+                                pairing.on_result(&tool_id, success, output, error)
                             {
                                 let _ = event_tx.send(paired).await;
                             } else {
@@ -543,9 +545,16 @@ async fn run_gemini_inner(
                             fatal_error = Some(msg);
                             terminate = true;
                         }
-                        TranslatedEvent::Result { status: _ } => {
+                        TranslatedEvent::Result {
+                            status,
+                            error_message,
+                        } => {
                             saw_recognized = true;
-                            saw_terminal_result = true;
+                            if status != "success" {
+                                let detail = error_message
+                                    .unwrap_or_else(|| format!("gemini result status: {}", status));
+                                fatal_error = Some(detail);
+                            }
                             terminate = true;
                         }
                         TranslatedEvent::SchemaMismatch {
@@ -604,14 +613,18 @@ async fn run_gemini_inner(
         }
     };
 
-    // Surface a fatal protocol-level error first if one arrived.
-    if let Some(msg) = fatal_error.clone() {
+    // Surface a fatal protocol-level error first if one arrived. `take()` so
+    // the guards below can check `fatal_error.is_none()` to avoid duplicate
+    // error reports from the stderr-non-zero-exit path and the version-drift
+    // fallback.
+    let had_fatal = fatal_error.is_some();
+    if let Some(msg) = fatal_error.take() {
         let _ = event_tx.send(HarnessEvent::Error(msg)).await;
     }
 
     // Non-zero exit → surface sanitized stderr.
     if let Some(status) = status {
-        if !status.success() && fatal_error.is_none() {
+        if !status.success() && !had_fatal {
             let raw_stderr = match stderr {
                 Some(s) => {
                     use tokio::io::AsyncReadExt;
@@ -623,12 +636,14 @@ async fn run_gemini_inner(
                 None => Vec::new(),
             };
             let stderr_raw = String::from_utf8_lossy(&raw_stderr).trim().to_string();
-            tracing::debug!("gemini run non-zero exit; raw stderr: {}", stderr_raw);
+            let sanitized = sanitize_stderr(&stderr_raw);
+            // Log the sanitized form — never the raw bytes — so debug-level
+            // logs can't leak secrets when `RUST_LOG=debug` is enabled.
+            tracing::debug!("gemini run non-zero exit; stderr: {}", sanitized);
             let code = status
                 .code()
                 .map(|c| c.to_string())
                 .unwrap_or_else(|| "signal".to_string());
-            let sanitized = sanitize_stderr(&stderr_raw);
             let detail = if sanitized.is_empty() {
                 format!("gemini exited with status {} (no stderr)", code)
             } else {
@@ -645,7 +660,7 @@ async fn run_gemini_inner(
         } else if saw_unknown {
             "gemini: no recognized events received (version drift — check `gemini --version`)"
                 .to_string()
-        } else if fatal_error.is_none() {
+        } else if !had_fatal {
             "gemini: no response content".to_string()
         } else {
             // A fatal error already surfaced; avoid duplicating.
@@ -656,8 +671,6 @@ async fn run_gemini_inner(
         }
     }
 
-    let _ = saw_terminal_result;
-
     let sid = captured_session_id.clone().unwrap_or_default();
     let _ = event_tx.send(HarnessEvent::Done { session_id: sid }).await;
 }
@@ -666,12 +679,11 @@ async fn run_gemini_inner(
 /// [`TranslatedEvent`]s. Returns `None` for unrecognized event types so
 /// callers can count them for diagnostics.
 ///
-/// `message` events may arrive as streamed deltas (`delta` field set on each
-/// chunk) or as a single atomic message (`content` only). Both shapes are
-/// translated to one or more `Text` variants; the read loop accumulates
-/// deltas into a single `HarnessEvent::Text` when an `AssistantDone` marker
-/// arrives (observed at the start of the next non-message event, or at
-/// stream close).
+/// For `message` events, `content` always carries the text and `delta: true`
+/// marks it as a streaming chunk. Delta chunks translate to a bare `Text`
+/// variant (no `AssistantDone`), so the read loop keeps accumulating until
+/// an atomic message, a non-message event, or stream close flushes the
+/// buffer.
 pub(crate) fn translate_event(event: &serde_json::Value) -> Option<Vec<TranslatedEvent>> {
     let ty = event.get("type").and_then(|t| t.as_str())?;
     match ty {
@@ -698,36 +710,35 @@ pub(crate) fn translate_event(event: &serde_json::Value) -> Option<Vec<Translate
             if role != "assistant" {
                 return Some(Vec::new());
             }
-            // Prefer `delta` (incremental) over `content` (atomic). Missing
-            // both → schema drift.
-            let delta = event.get("delta").and_then(|v| v.as_str());
-            let content = event.get("content").and_then(|v| v.as_str());
-            match (delta, content) {
-                (Some(d), _) => {
-                    if d.is_empty() {
-                        Some(Vec::new())
-                    } else {
-                        Some(vec![TranslatedEvent::Text(d.to_string())])
-                    }
-                }
-                (None, Some(c)) => {
-                    if c.is_empty() {
-                        // Empty atomic message: emit an AssistantDone marker
-                        // so the read loop flushes any accumulated buffer.
-                        Some(vec![TranslatedEvent::AssistantDone])
-                    } else {
-                        // Atomic, one-shot assistant message: emit the text
-                        // then mark the turn complete.
-                        Some(vec![
-                            TranslatedEvent::Text(c.to_string()),
-                            TranslatedEvent::AssistantDone,
-                        ])
-                    }
-                }
-                (None, None) => Some(vec![TranslatedEvent::SchemaMismatch {
+            // `content` is required by the upstream MessageEvent interface;
+            // `delta` is an optional boolean that marks a streaming chunk.
+            let Some(content) = event.get("content").and_then(|v| v.as_str()) else {
+                return Some(vec![TranslatedEvent::SchemaMismatch {
                     event_type: "message".into(),
-                    missing_field: "content|delta".into(),
-                }]),
+                    missing_field: "content".into(),
+                }]);
+            };
+            let is_delta = event
+                .get("delta")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if content.is_empty() {
+                if is_delta {
+                    Some(Vec::new())
+                } else {
+                    // Empty atomic message: flush any accumulated buffer.
+                    Some(vec![TranslatedEvent::AssistantDone])
+                }
+            } else if is_delta {
+                // Streaming chunk — accumulate; the read loop flushes on the
+                // next non-message event or on stream close.
+                Some(vec![TranslatedEvent::Text(content.to_string())])
+            } else {
+                // Atomic, one-shot assistant message.
+                Some(vec![
+                    TranslatedEvent::Text(content.to_string()),
+                    TranslatedEvent::AssistantDone,
+                ])
             }
         }
         "tool_use" => {
@@ -769,10 +780,15 @@ pub(crate) fn translate_event(event: &serde_json::Value) -> Option<Vec<Translate
                 Some(s) => s.to_string(),
                 None => serde_json::to_string(v).unwrap_or_default(),
             });
-            let error = event
-                .get("error")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            // Upstream `tool_result.error` is `{type, message}` — extract the
+            // message; tolerate a plain string for forward-compat with future
+            // schema changes.
+            let error = event.get("error").and_then(|e| {
+                e.get("message")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| e.as_str())
+                    .map(|s| s.to_string())
+            });
             Some(vec![TranslatedEvent::ToolResult {
                 tool_id: tool_id.to_string(),
                 success,
@@ -791,8 +807,11 @@ pub(crate) fn translate_event(event: &serde_json::Value) -> Option<Vec<Translate
                 .unwrap_or("")
                 .to_string();
             match severity {
-                "warning" => Some(vec![TranslatedEvent::Warning(message)]),
-                _ => Some(vec![TranslatedEvent::ErrorFatal(message)]),
+                "error" => Some(vec![TranslatedEvent::ErrorFatal(message)]),
+                // `"warning"` is the only other value in the upstream type, but
+                // any other severity ("info", future additions) is treated as
+                // non-fatal to keep the read loop resilient to new levels.
+                _ => Some(vec![TranslatedEvent::Warning(message)]),
             }
         }
         "result" => {
@@ -801,7 +820,15 @@ pub(crate) fn translate_event(event: &serde_json::Value) -> Option<Vec<Translate
                 .and_then(|v| v.as_str())
                 .unwrap_or("success")
                 .to_string();
-            Some(vec![TranslatedEvent::Result { status }])
+            let error_message = event
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            Some(vec![TranslatedEvent::Result {
+                status,
+                error_message,
+            }])
         }
         _ => None,
     }
@@ -842,7 +869,14 @@ pub(crate) enum TranslatedEvent {
     /// `error` with `severity == "error"` — terminates the stream.
     ErrorFatal(String),
     /// Terminal `result` event — ends the read loop after processing.
-    Result { status: String },
+    ///
+    /// `error_message` is the nested `result.error.message` payload, populated
+    /// only when `status != "success"`. The read loop surfaces it as the
+    /// fatal-error message when present.
+    Result {
+        status: String,
+        error_message: Option<String>,
+    },
     /// Recognized event type with a required field absent — indicates schema
     /// drift between terminus and upstream gemini-cli.
     SchemaMismatch {
@@ -861,6 +895,10 @@ pub(crate) enum TranslatedEvent {
 /// - `flush_pending` drains any still-open entries at stream close; each is
 ///   emitted with `output: None` so the user sees the invocation even when
 ///   the tool didn't produce a result event before the stream ended
+///
+/// Bounded at [`Self::CAP`] entries to prevent unbounded memory growth from
+/// a pathological stream that emits many orphaned `tool_use` events. At cap,
+/// `on_use` evicts an arbitrary entry before inserting.
 pub(crate) struct ToolPairingBuffer {
     pending: HashMap<String, PendingToolUse>,
 }
@@ -872,6 +910,11 @@ struct PendingToolUse {
 }
 
 impl ToolPairingBuffer {
+    /// Maximum number of unpaired `tool_use` entries retained at once.
+    /// Reached only by a pathological or drifted gemini stream; in normal
+    /// operation the count is small (bounded by model concurrency).
+    pub(crate) const CAP: usize = 256;
+
     pub(crate) fn new() -> Self {
         Self {
             pending: HashMap::new(),
@@ -884,6 +927,19 @@ impl ToolPairingBuffer {
     }
 
     pub(crate) fn on_use(&mut self, tool_id: String, tool: String, input: Option<String>) {
+        if self.pending.len() >= Self::CAP && !self.pending.contains_key(&tool_id) {
+            // Evict an arbitrary entry — order isn't meaningful for resource
+            // safety and any concrete ordering would need a separate data
+            // structure. Log once per evict so the drift is observable.
+            if let Some(k) = self.pending.keys().next().cloned() {
+                tracing::warn!(
+                    evicted_tool_id = %k,
+                    cap = Self::CAP,
+                    "gemini tool-pairing buffer at cap; evicting oldest entry"
+                );
+                self.pending.remove(&k);
+            }
+        }
         self.pending.insert(tool_id, PendingToolUse { tool, input });
     }
 
@@ -976,13 +1032,14 @@ mod tests {
     // ── translate_event: message (assistant delta / content) ────────────────
 
     #[test]
-    fn translate_message_assistant_delta_returns_text() {
+    fn translate_message_assistant_delta_chunk_returns_text_without_done() {
         let ev = serde_json::json!({
             "type": "message",
             "role": "assistant",
-            "delta": "hello"
+            "content": "hello",
+            "delta": true
         });
-        let out = translate_event(&ev).expect("delta translates");
+        let out = translate_event(&ev).expect("delta chunk translates");
         assert_eq!(out.len(), 1);
         assert_eq!(out[0], TranslatedEvent::Text("hello".into()));
     }
@@ -1001,6 +1058,20 @@ mod tests {
     }
 
     #[test]
+    fn translate_message_assistant_delta_false_is_atomic() {
+        let ev = serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": "full answer",
+            "delta": false
+        });
+        let out = translate_event(&ev).expect("atomic message with explicit delta=false");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], TranslatedEvent::Text("full answer".into()));
+        assert_eq!(out[1], TranslatedEvent::AssistantDone);
+    }
+
+    #[test]
     fn translate_message_user_role_is_ignored() {
         let ev = serde_json::json!({
             "type": "message",
@@ -1012,18 +1083,31 @@ mod tests {
     }
 
     #[test]
-    fn translate_message_empty_delta_returns_empty_vec() {
+    fn translate_message_empty_delta_chunk_returns_empty_vec() {
         let ev = serde_json::json!({
             "type": "message",
             "role": "assistant",
-            "delta": ""
+            "content": "",
+            "delta": true
         });
-        let out = translate_event(&ev).expect("empty delta translates");
+        let out = translate_event(&ev).expect("empty delta chunk translates");
         assert!(out.is_empty());
     }
 
     #[test]
-    fn translate_message_missing_both_content_and_delta_returns_schema_mismatch() {
+    fn translate_message_empty_atomic_content_emits_assistant_done() {
+        let ev = serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": ""
+        });
+        let out = translate_event(&ev).expect("empty atomic translates");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], TranslatedEvent::AssistantDone);
+    }
+
+    #[test]
+    fn translate_message_missing_content_returns_schema_mismatch() {
         let ev = serde_json::json!({
             "type": "message",
             "role": "assistant"
@@ -1036,7 +1120,7 @@ mod tests {
                 missing_field,
             } => {
                 assert_eq!(event_type, "message");
-                assert!(missing_field.contains("content") && missing_field.contains("delta"));
+                assert_eq!(missing_field, "content");
             }
             other => panic!("expected SchemaMismatch, got {:?}", other),
         }
@@ -1113,12 +1197,12 @@ mod tests {
     }
 
     #[test]
-    fn translate_tool_result_error_carries_error_message() {
+    fn translate_tool_result_error_object_extracts_message() {
         let ev = serde_json::json!({
             "type": "tool_result",
             "tool_id": "tu_2",
             "status": "error",
-            "error": "permission denied"
+            "error": {"type": "permission", "message": "permission denied"}
         });
         let out = translate_event(&ev).expect("error tool_result translates");
         match &out[0] {
@@ -1136,6 +1220,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn translate_tool_result_error_string_fallback() {
+        // Forward-compat: a plain-string error (pre-schema-rev or variant)
+        // should still be extracted rather than dropped.
+        let ev = serde_json::json!({
+            "type": "tool_result",
+            "tool_id": "tu_2",
+            "status": "error",
+            "error": "permission denied"
+        });
+        let out = translate_event(&ev).expect("error tool_result translates");
+        match &out[0] {
+            TranslatedEvent::ToolResult { error, .. } => {
+                assert_eq!(error.as_deref(), Some("permission denied"));
+            }
+            other => panic!("expected ToolResult, got {:?}", other),
+        }
+    }
+
     // ── translate_event: error severities ───────────────────────────────────
 
     #[test]
@@ -1147,7 +1250,10 @@ mod tests {
         });
         let out = translate_event(&ev).expect("error event translates");
         assert_eq!(out.len(), 1);
-        assert_eq!(out[0], TranslatedEvent::ErrorFatal("model overloaded".into()));
+        assert_eq!(
+            out[0],
+            TranslatedEvent::ErrorFatal("model overloaded".into())
+        );
     }
 
     #[test]
@@ -1174,11 +1280,48 @@ mod tests {
         let out = translate_event(&ev).expect("result translates");
         assert_eq!(out.len(), 1);
         match &out[0] {
-            TranslatedEvent::Result { status } => {
+            TranslatedEvent::Result {
+                status,
+                error_message,
+            } => {
                 assert_eq!(status, "success");
+                assert!(error_message.is_none());
             }
             other => panic!("expected Result, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn translate_result_error_captures_error_message() {
+        let ev = serde_json::json!({
+            "type": "result",
+            "status": "error",
+            "error": {"type": "quota", "message": "monthly quota exceeded"}
+        });
+        let out = translate_event(&ev).expect("result translates");
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            TranslatedEvent::Result {
+                status,
+                error_message,
+            } => {
+                assert_eq!(status, "error");
+                assert_eq!(error_message.as_deref(), Some("monthly quota exceeded"));
+            }
+            other => panic!("expected Result, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_error_unknown_severity_defaults_to_warning() {
+        let ev = serde_json::json!({
+            "type": "error",
+            "severity": "info",
+            "message": "heads up"
+        });
+        let out = translate_event(&ev).expect("error translates");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], TranslatedEvent::Warning("heads up".into()));
     }
 
     #[test]
@@ -1305,6 +1448,19 @@ mod tests {
         assert_eq!(buf.pending_len(), 0);
     }
 
+    #[test]
+    fn pairing_buffer_caps_pending_entries_evicting_arbitrary_oldest() {
+        let mut buf = ToolPairingBuffer::new();
+        for i in 0..ToolPairingBuffer::CAP + 5 {
+            buf.on_use(format!("t{}", i), "tool".into(), None);
+        }
+        assert_eq!(
+            buf.pending_len(),
+            ToolPairingBuffer::CAP,
+            "pending must not exceed CAP"
+        );
+    }
+
     // ── sanitize_stderr parity with opencode ────────────────────────────────
 
     #[test]
@@ -1312,6 +1468,21 @@ mod tests {
         let long = "x".repeat(600);
         let out = sanitize_stderr(&long);
         assert!(out.len() <= 500);
+    }
+
+    #[test]
+    fn sanitize_stderr_redacts_lowercase_env_var_assignments() {
+        let input = "gemini_api_key=AIzaSy-redact-me failed to connect";
+        let out = sanitize_stderr(input);
+        assert!(
+            !out.contains("AIzaSy-redact-me"),
+            "lowercase env-var value leaked: {}",
+            out
+        );
+        assert!(
+            out.contains("gemini_api_key"),
+            "lowercase key name should remain"
+        );
     }
 
     #[test]
@@ -1490,7 +1661,8 @@ mod tests {
         let args = build_argv("hi", None, &opts, &cfg);
         let pos = args.iter().position(|a| a == "-r").expect("missing -r");
         assert_eq!(
-            args[pos + 1], "latest",
+            args[pos + 1],
+            "latest",
             "bare --continue should map to `-r latest`"
         );
     }
@@ -1523,7 +1695,8 @@ mod tests {
         let args = build_argv("hi", None, &opts, &cfg);
         let pos = args.iter().position(|a| a == "-m").expect("missing -m");
         assert_eq!(
-            args[pos + 1], "flash-lite",
+            args[pos + 1],
+            "flash-lite",
             "per-prompt model should win over config"
         );
     }
@@ -1555,16 +1728,28 @@ mod tests {
         assert_eq!(args[pos + 1], "yolo");
     }
 
-    // ── strip_ansi ──────────────────────────────────────────────────────────
-
     #[test]
-    fn strip_ansi_removes_color_codes() {
-        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m"), "red");
-    }
-
-    #[test]
-    fn strip_ansi_passes_plain_text() {
-        assert_eq!(strip_ansi("hello"), "hello");
+    fn argv_approval_mode_option_overrides_config() {
+        let opts = HarnessOptions {
+            approval_mode: Some("plan".into()),
+            ..Default::default()
+        };
+        let cfg = GeminiConfig {
+            approval_mode: Some("yolo".into()),
+            ..Default::default()
+        };
+        let args = build_argv("hi", None, &opts, &cfg);
+        let pos = args
+            .iter()
+            .position(|a| a == "--approval-mode")
+            .expect("missing --approval-mode");
+        assert_eq!(
+            args[pos + 1],
+            "plan",
+            "per-prompt approval_mode should win over config"
+        );
+        let count = args.iter().filter(|a| *a == "--approval-mode").count();
+        assert_eq!(count, 1, "only one --approval-mode expected");
     }
 
     // ── Panic formatter ────────────────────────────────────────────────────
@@ -1581,7 +1766,10 @@ mod tests {
     #[test]
     fn format_panic_on_unknown() {
         let boxed: Box<dyn std::any::Any + Send> = Box::new(42u32);
-        assert_eq!(format_panic_message(&*boxed), "gemini: internal panic (unknown)");
+        assert_eq!(
+            format_panic_message(&*boxed),
+            "gemini: internal panic (unknown)"
+        );
     }
 
     // ── Ambient event emission ─────────────────────────────────────────────
@@ -1607,6 +1795,47 @@ mod tests {
                 assert_eq!(run_id, "run-g1");
             }
             other => panic!("expected HarnessStarted, got {:?}", other),
+        }
+    }
+
+    // ── Attachment rejection ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn attachments_rejected_with_error_and_done() {
+        let (tx, _rx) = broadcast::channel::<AmbientEvent>(8);
+        let h = GeminiHarness::new(GeminiConfig::default(), tx);
+        let att = Attachment {
+            path: std::path::PathBuf::from("/tmp/terminus-nonexistent-attachment.png"),
+            filename: "foo.png".into(),
+            media_type: "image/png".into(),
+        };
+        let opts = HarnessOptions::default();
+        let cwd = std::env::temp_dir();
+        let mut rx = h
+            .run_prompt("hi with an image", &[att], &cwd, None, &opts)
+            .await
+            .expect("run_prompt ok");
+
+        let first = rx.recv().await.expect("expected Error");
+        match first {
+            HarnessEvent::Error(msg) => {
+                assert!(
+                    msg.contains("attachments are not yet supported"),
+                    "unexpected error body: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+        let second = rx.recv().await.expect("expected Done");
+        match second {
+            HarnessEvent::Done { session_id } => {
+                assert!(
+                    session_id.is_empty(),
+                    "session_id should be empty on attachment rejection"
+                );
+            }
+            other => panic!("expected Done, got {:?}", other),
         }
     }
 
@@ -1712,7 +1941,10 @@ mod tests {
         }
 
         let sid2 = second_session_id.expect("second prompt should yield a session_id");
-        assert_eq!(sid, sid2, "both prompts should report the same gemini sessionID");
+        assert_eq!(
+            sid, sid2,
+            "both prompts should report the same gemini sessionID"
+        );
     }
 
     #[tokio::test]
@@ -1745,5 +1977,55 @@ mod tests {
             }
         }
         assert!(saw_error_or_done, "expected a clean error/Done path");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn ac4_tool_use_visibility_with_approval_yolo() {
+        if std::env::var("TERMINUS_HAS_GEMINI").is_err() {
+            eprintln!("skip: TERMINUS_HAS_GEMINI not set");
+            return;
+        }
+        let (tx, _rx) = broadcast::channel::<AmbientEvent>(8);
+        let cfg = GeminiConfig {
+            model: Some("flash".into()),
+            approval_mode: Some("yolo".into()),
+            ..Default::default()
+        };
+        let h = GeminiHarness::new(cfg, tx);
+        let opts = HarnessOptions::default();
+        let cwd = std::env::temp_dir();
+        let mut rx = h
+            .run_prompt(
+                "read the first line of /etc/hostname and reply with it verbatim",
+                &[],
+                &cwd,
+                None,
+                &opts,
+            )
+            .await
+            .expect("run_prompt ok");
+
+        let mut saw_tool_use = false;
+        let mut saw_done = false;
+        while let Some(ev) = tokio::time::timeout(std::time::Duration::from_secs(180), rx.recv())
+            .await
+            .expect("timeout")
+        {
+            match ev {
+                HarnessEvent::ToolUse { .. } => saw_tool_use = true,
+                HarnessEvent::Done { .. } => {
+                    saw_done = true;
+                    break;
+                }
+                HarnessEvent::Error(e) => panic!("harness error: {}", e),
+                _ => {}
+            }
+        }
+        assert!(
+            saw_tool_use,
+            "a tool-using prompt should yield at least one paired ToolUse event"
+        );
+        assert!(saw_done, "Done event expected");
     }
 }

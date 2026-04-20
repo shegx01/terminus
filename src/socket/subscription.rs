@@ -26,6 +26,7 @@ impl SubscriptionRegistry {
     }
 
     /// Add a subscription. Returns `Err(())` if the limit is exceeded.
+    #[allow(clippy::result_unit_err)]
     pub fn add(&mut self, id: String, filter: Filter) -> Result<(), ()> {
         if self.subs.len() >= self.max && !self.subs.contains_key(&id) {
             return Err(());
@@ -35,6 +36,7 @@ impl SubscriptionRegistry {
     }
 
     /// Remove a subscription. Returns `Err(())` if not found.
+    #[allow(clippy::result_unit_err)]
     pub fn remove(&mut self, id: &str) -> Result<(), ()> {
         self.subs.remove(id).map(|_| ()).ok_or(())
     }

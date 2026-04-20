@@ -71,6 +71,9 @@ pub struct HarnessOptions {
     /// "Continue last session" — opencode `-c` without a specific name.
     /// Distinguished from `resume: Option<String>` (name-based resume).
     pub continue_last: bool,
+    /// Gemini-only: `--approval-mode <default|auto_edit|yolo|plan>`. Overrides
+    /// the `[harness.gemini].approval_mode` config when set.
+    pub approval_mode: Option<String>,
 }
 
 impl HarnessOptions {
@@ -94,6 +97,7 @@ impl HarnessOptions {
             && !self.pure
             && !self.fork
             && !self.continue_last
+            && self.approval_mode.is_none()
     }
 
     /// Build a human-readable summary of active options for the ON confirmation message.
@@ -156,6 +160,9 @@ impl HarnessOptions {
         }
         if self.continue_last {
             parts.push("continue-last".to_string());
+        }
+        if let Some(ref am) = self.approval_mode {
+            parts.push(format!("approval-mode={}", am));
         }
         parts.join(", ")
     }
@@ -346,6 +353,11 @@ impl ParsedCommand {
                             trimmed
                         )));
                     }
+                    if kind == HarnessKind::Gemini && options.fork {
+                        return Err(ParseError::InvalidHarnessOption(
+                            "gemini does not support --fork — remove the flag".into(),
+                        ));
+                    }
                     let initial_prompt = if prompt.is_empty() {
                         None
                     } else {
@@ -442,10 +454,33 @@ impl ParsedCommand {
                     // Fallthrough: not a subcommand, treat as prompt (existing behavior).
                 }
 
+                // Gemini-only: block gemini's native interactive/destructive subcommands
+                // so `: gemini mcp`/`extensions`/`skills`/`update` return a chat-safe
+                // error instead of silently hanging (mcp opens a TTY, update needs
+                // interactive confirmation, etc.).
+                if kind == HarnessKind::Gemini && !after_harness.is_empty() {
+                    let first = after_harness.split_whitespace().next().unwrap_or("");
+                    const GEMINI_BLOCKED: &[&str] = &["update", "mcp", "extensions", "skills"];
+                    if GEMINI_BLOCKED.contains(&first) {
+                        return Err(ParseError::InvalidHarnessOption(format!(
+                            "`gemini {}` is not available from chat — run it in your terminal. \
+                             No chat-safe gemini subcommands are shipped yet.",
+                            first
+                        )));
+                    }
+                }
+
                 if !after_harness.is_empty() {
                     // Extract any leading --flags before the actual prompt text.
                     // e.g. `: claude --schema=foo my prompt` → options={schema: "foo"}, prompt="my prompt"
                     let (options, prompt) = split_prompt_options(after_harness)?;
+                    // Gemini CLI has no `--fork` analog — reject rather than
+                    // parse-accept-then-silently-drop at build_argv.
+                    if kind == HarnessKind::Gemini && options.fork {
+                        return Err(ParseError::InvalidHarnessOption(
+                            "gemini does not support --fork — remove the flag".into(),
+                        ));
+                    }
                     return Ok(ParsedCommand::HarnessPrompt {
                         harness: kind,
                         prompt,
@@ -744,6 +779,20 @@ fn parse_harness_options_tokens(
             "--fork" => {
                 opts.fork = true;
             }
+            "--approval-mode" => {
+                let val = get_value!();
+                match val.as_str() {
+                    "default" | "auto_edit" | "yolo" | "plan" => {
+                        opts.approval_mode = Some(val);
+                    }
+                    _ => {
+                        return Err(ParseError::InvalidHarnessOption(format!(
+                            "Invalid --approval-mode '{}' — expected default, auto_edit, yolo, or plan",
+                            val
+                        )));
+                    }
+                }
+            }
             other => {
                 // Better error for short-flag=value syntax (e.g. `-m=opus`)
                 if other.starts_with('-') && other.contains('=') {
@@ -754,7 +803,7 @@ fn parse_harness_options_tokens(
                     )));
                 }
                 return Err(ParseError::InvalidHarnessOption(format!(
-                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config, --permission-mode, --schema, --name, --resume, --continue, --agent, --title, --share, --pure, --fork",
+                    "Unknown option '{}'. Supported: --model, --effort, --system-prompt, --append-system-prompt, --add-dir, --max-turns, --settings, --mcp-config, --permission-mode, --schema, --name, --resume, --continue, --agent, --title, --share, --pure, --fork, --approval-mode",
                     other
                 )));
             }
@@ -2677,6 +2726,167 @@ mod tests {
                 options: HarnessOptions::default(),
             }
         );
+    }
+
+    // ── Gemini blocked-subcommand tests ─────────────────────────────────────
+
+    #[test]
+    fn parse_gemini_blocked_subcommands_all_rejected() {
+        let blocked = ["update", "mcp", "extensions", "skills"];
+        for kw in &blocked {
+            let input = format!(": gemini {}", kw);
+            match ParsedCommand::parse(&input, ':') {
+                Err(ParseError::InvalidHarnessOption(msg)) => {
+                    assert!(
+                        msg.contains("not available from chat")
+                            && msg.contains(kw),
+                        "blocked gemini keyword `{}` did not surface a terminal-only error; got: {}",
+                        kw,
+                        msg
+                    );
+                }
+                other => panic!(
+                    "blocked gemini keyword `{}` should be rejected, got {:?}",
+                    kw, other
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_gemini_unknown_first_word_is_prompt() {
+        // Non-blocked first words fall through to prompt parsing (no gemini
+        // subcommand passthrough is shipped yet).
+        let cmd = ParsedCommand::parse(": gemini sessions", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness, prompt, ..
+            } => {
+                assert_eq!(harness, HarnessKind::Gemini);
+                assert_eq!(prompt, "sessions");
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    // ── Gemini em-dash normalization ────────────────────────────────────────
+
+    #[test]
+    fn parse_gemini_em_dashed_name_is_normalized() {
+        let cmd = ParsedCommand::parse(": gemini —name auth fix a bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                harness,
+                options,
+                prompt,
+            } => {
+                assert_eq!(harness, HarnessKind::Gemini);
+                assert_eq!(options.name.as_deref(), Some("auth"));
+                assert_eq!(prompt, "fix a bug");
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    // ── --approval-mode parser ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_gemini_approval_mode_yolo() {
+        let cmd = ParsedCommand::parse(": gemini --approval-mode yolo fix a bug", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt {
+                options, prompt, ..
+            } => {
+                assert_eq!(options.approval_mode.as_deref(), Some("yolo"));
+                assert_eq!(prompt, "fix a bug");
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_gemini_approval_mode_invalid_rejected() {
+        let err = ParsedCommand::parse(": gemini --approval-mode banana hi", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(msg.contains("--approval-mode"), "got: {}", msg);
+                assert!(msg.contains("banana"), "got: {}", msg);
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_gemini_approval_mode_equals_syntax() {
+        let cmd = ParsedCommand::parse(": gemini --approval-mode=plan hi", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt { options, .. } => {
+                assert_eq!(options.approval_mode.as_deref(), Some("plan"));
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_gemini_fork_is_rejected_with_specific_error() {
+        let err = ParsedCommand::parse(": gemini --fork --continue hi", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("gemini does not support --fork"),
+                    "expected gemini-specific fork rejection; got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_gemini_on_fork_is_rejected() {
+        let err = ParsedCommand::parse(": gemini on --fork --continue", ':').unwrap_err();
+        match err {
+            ParseError::InvalidHarnessOption(msg) => {
+                assert!(
+                    msg.contains("gemini does not support --fork"),
+                    "got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected InvalidHarnessOption, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_fork_still_accepted() {
+        // Regression guard: the gemini-specific rejection must not leak
+        // to other harnesses. `--fork` + `--resume <name>` is opencode's
+        // canonical forking pattern.
+        let cmd =
+            ParsedCommand::parse(": opencode --fork --resume review keep going", ':').unwrap();
+        match cmd {
+            ParsedCommand::HarnessPrompt { options, .. } => {
+                assert!(options.fork, "opencode --fork must still parse");
+                assert_eq!(options.resume.as_deref(), Some("review"));
+            }
+            other => panic!("expected HarnessPrompt, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn harness_options_summary_includes_approval_mode() {
+        let opts = HarnessOptions {
+            approval_mode: Some("yolo".into()),
+            name: Some("auth".into()),
+            ..Default::default()
+        };
+        let summary = opts.summary();
+        assert!(
+            summary.contains("approval-mode=yolo"),
+            "summary must show approval mode for visibility; got: {}",
+            summary
+        );
+        assert!(summary.contains("name=auth"));
     }
 
     // ── Per-prompt flag tests ────────────────────────────────────────────────

@@ -221,7 +221,6 @@ pub struct HarnessConfig {
     /// the harness resolves `gemini` from PATH and inherits the user's own
     /// CLI config.
     #[serde(default)]
-    #[allow(dead_code)] // read once App wires GeminiHarness into the harness map
     pub gemini: Option<GeminiConfig>,
 }
 
