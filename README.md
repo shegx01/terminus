@@ -45,12 +45,15 @@ terminus gives you remote access to terminal sessions and AI harnesses from your
 | claude   |    ✓     |      ✓      |       ✓        |        ✓        |         ✓         |      ✓      |
 | opencode |    ✓     |      ✓      |       ✓        |       ✓¹        |         ✗²        |      ✓      |
 | gemini   |    ✓     |      ✓      |       ✓        |       ✓³        |         ✗²        |      ✗⁴     |
-| codex    |   stub   |    stub     |      stub      |      stub       |       stub        |    stub     |
+| codex    |    ✓     |      ✓      |       ✓        |       ✓⁵        |        ✓⁶         |     ✓⁷      |
 
 ¹ Tool-use events are forwarded when opencode emits them; tool-enabled agents (e.g. "build") emit tool_use JSON events, others may not. Set `agent = "build"` in `[harness.opencode]` config or pass `--agent build` per-prompt
 ² Opencode and gemini CLIs have no schema-constrained output surface -- use the claude harness for `--schema` workflows
 ³ Tool-use events from gemini arrive as separate `tool_use` + `tool_result` frames linked by `tool_id`; terminus coalesces them into a single event with both input and output. Enable tool-using behavior with `--approval-mode yolo` (or `auto_edit` / `plan`)
 ⁴ Inbound attachments (images / files) are rejected by the gemini harness with a chat-safe error rather than silently dropped; multimodal threading is a follow-up
+⁵ Tool-use events from codex arrive as paired `item.started` + `item.completed` frames linked by `item.id` for tool kinds (`command_execution`, `file_change`, `mcp_tool_call`, `web_search`, `plan_update`); `agent_message` items go straight to text. terminus reuses the same `ToolPairingBuffer` as gemini
+⁶ Codex `--schema` accepts inline JSON or a file path; the value is validated as JSON, written to a temp file, and passed as `--output-schema <path>`. The validated response is rendered as a fenced JSON block in chat (no webhook delivery — that path is claude-only)
+⁷ Image-only attachment whitelist (case-insensitive): `image/png`, `image/jpeg`, `image/jpg`, `image/webp`. Non-image MIME types are rejected with a chat-safe error
 
 ---
 
@@ -208,6 +211,20 @@ Gemini CLI flags are mapped to their own idioms -- `-r latest` for bare `--conti
 
 **Full flag + event-schema reference:** [docs/gemini.md](docs/gemini.md)
 
+**Codex** -- prompt OpenAI's `codex` CLI from chat (verified against codex-cli **0.125.0**), with paired tool-use events, named sessions, image attachments, and structured output:
+
+```
+: codex --model gpt-5.4 explain this codebase
+: codex on --name auth --sandbox workspace-write
+What does the auth module do?
+Can you fix the JWT validation bug?
+: codex off
+```
+
+Codex always runs with `--full-auto --skip-git-repo-check` (codex 0.125.0 removed the prior `--ask-for-approval` flag, so `--full-auto` is the only non-interactive default that won't deadlock). Sandbox values: `read-only` / `workspace-write` / `danger-full-access`. ChatGPT-account auth rejects `gpt-5.5` (API-only); use `gpt-5.4` or `gpt-5.3-codex`. Image attachments are forwarded via `-i` (image-only whitelist). All native subcommands (`login`, `cloud`, `apply`, `mcp`, `plugin`, `debug`, etc.) are blocked from chat — run them in your terminal.
+
+**Full flag + event-schema reference:** [docs/codex.md](docs/codex.md)
+
 **Programmatic access** -- drive terminus from scripts, agents, or dashboards via WebSocket:
 
 ```bash
@@ -233,6 +250,7 @@ websocat ws://127.0.0.1:7645 -H "Authorization: Bearer tk_live_..."
 - **Claude Code CLI** (for `: claude` commands -- `npm i -g @anthropic-ai/claude-code`)
 - **opencode** (optional, for `: opencode` commands -- see [OpenCode integration](#opencode-integration-optional))
 - **gemini** (optional, for `: gemini` commands -- see [Gemini integration](#gemini-integration-optional))
+- **codex** (optional, for `: codex` commands -- see [Codex integration](#codex-integration-optional))
 - At least one of: Telegram bot token, Slack bot + app tokens, Discord bot token, or Socket API enabled
 
 ---
@@ -406,6 +424,8 @@ Optional overrides:
 
 **Blocked from chat** (run in your terminal instead): `acp`, `agent`, `attach`, `auth`, `debug`, `github`, `import`, `login`, `logout`, `mcp`, `serve`, `session`, `tui`, `uninstall`, `upgrade`, `web`. Terminus returns a clear error if you try these from chat. Note: `session list` / `session ls` and `auth list` / `auth ls` ARE supported as safe read-only aliases.
 
+**`--schema` is not supported.** Opencode's CLI has no schema-constrained output surface; passing `--schema` to `: opencode ...` returns a chat-safe redirect error pointing at the claude harness. Use `: claude --schema=<name> <prompt>` for validated structured output (full pipeline including webhook delivery + retry queue) or `: codex --schema=<inline-or-path> <prompt>` for chat-only validation without webhook delivery.
+
 See [docs/opencode.md](docs/opencode.md) for the full CLI reference.
 
 ### Gemini integration (optional)
@@ -432,7 +452,51 @@ Optional overrides:
 
 **Per-prompt flags:** `--name`, `--resume`, `--continue` (named or bare), `--model` / `-m`, `--approval-mode`. Opencode-only flags (`--title`, `--share`, `--pure`, `--fork`) are not supported by gemini and return a parse error. Attachments (images / files) are rejected with a chat-safe error -- multimodal threading is a follow-up.
 
+**`--schema` is not supported.** Gemini-cli has no schema-constrained output surface; passing `--schema` to `: gemini ...` returns a chat-safe redirect error pointing at the claude harness. Use `: claude --schema=<name> <prompt>` for validated structured output with webhook delivery, or `: codex --schema=<inline-or-path> <prompt>` for chat-only validation without webhook delivery.
+
 See [docs/gemini.md](docs/gemini.md) for the full CLI reference, event schema, error table, and functionality matrix.
+
+### Codex integration (optional)
+
+Codex runs as a subprocess -- terminus spawns `codex exec --json --full-auto --skip-git-repo-check [flags] <prompt>` per prompt (or `codex exec resume <thread_id>` for a named-session continuation) and inherits codex's own config (`~/.codex/config.toml`, profiles, ChatGPT/API auth). No extra terminus config is required if `codex` is on PATH and authenticated.
+
+Optional overrides:
+
+```toml
+[harness.codex]
+# Override the codex binary location (default: resolved via PATH)
+# binary_path = "/opt/homebrew/bin/codex"
+
+# Per-run model override. ChatGPT-account models: "gpt-5.4", "gpt-5.3-codex"
+# (gpt-5.5 is API-only and rejected on ChatGPT auth).
+# model = "gpt-5.4"
+
+# Per-run profile override (passed as `-p / --profile <name>`). Selects a
+# [profiles.<name>] block from ~/.codex/config.toml.
+# profile = "default"
+
+# Per-run sandbox policy. Values: "read-only" | "workspace-write" | "danger-full-access"
+# sandbox = "workspace-write"
+
+# Defense-in-depth: when true, terminus passes --ignore-user-config so codex
+# skips ~/.codex/config.toml entirely. Useful if a future codex profile field
+# could re-introduce TTY approval prompts. Default: false (respect user's profile).
+# ignore_user_config = false
+```
+
+**Requirements:** `codex` on PATH (`brew install --cask codex` or `npm install -g @openai/codex`), authenticated via `codex login` (ChatGPT account or API key).
+
+**Defaults applied unconditionally** by terminus regardless of these fields:
+- `--full-auto` -- codex 0.125.0 removed `--ask-for-approval`; this is the non-interactive default that won't deadlock.
+- `--skip-git-repo-check` -- terminus's tmux cwd may not always be a git repo.
+- `--ephemeral` -- added when no named/resumed session is in play, so one-shot prompts don't pollute codex's session log.
+- `Stdio::null()` for child stdin -- codex 0.125.0 reads stdin even when prompt is supplied as an arg, blocking forever otherwise.
+
+**Blocked from chat** (interactive, destructive, or v1.1-deferred; run in your terminal instead): `login`, `logout`, `mcp`, `mcp-server`, `app`, `app-server`, `exec-server`, `plugin`, `completion`, `features`, `debug`, `sandbox` (subcommand form, distinct from `--sandbox` flag), `cloud`, `apply`, `review`, `resume` (use `--resume <name>` flag), `fork`, `sessions`. All return targeted chat-safe error messages.
+
+**Per-prompt flags:** `--name`, `--resume`, `--continue` (named or bare), `--model` / `-m`, `--sandbox`, `--profile` (no `-p` short alias — collides with claude's `--permission-mode`), `--schema` (inline JSON or file path; passed as `--output-schema`. Validated response renders as a fenced JSON block in chat — **no webhook delivery; use the claude harness if you need it POSTed to a webhook with HMAC-signed retry**). Image attachments (`image/png`, `image/jpeg`, `image/jpg`, `image/webp`) are forwarded via codex's `-i` flag.
+
+See [docs/codex.md](docs/codex.md) for the full CLI reference, verified event schema, error table, and functionality matrix.
 
 ### Multiple platforms
 
@@ -636,7 +700,18 @@ Use `--resume` when you know the session exists and want to catch typos. `--cont
 
 ## Structured Output (--schema)
 
-terminus can instruct Claude to emit a validated JSON response that matches a JSON Schema you define, then optionally POST it to a webhook endpoint with HMAC-SHA256 authentication.
+terminus can instruct an AI harness to emit a validated JSON response that matches a JSON Schema you define, then optionally POST it to a webhook endpoint with HMAC-SHA256 authentication.
+
+**Harness support:**
+
+| Harness  | Schema validation | In-chat fenced JSON | Webhook delivery + retry queue |
+|----------|:----:|:----:|:----:|
+| claude   |  ✓   |  ✓   | ✓ (full pipeline below) |
+| codex    |  ✓   |  ✓   | ✗ (chat-only; use claude for downstream POST) |
+| opencode |  ✗   |  ✗   | n/a |
+| gemini   |  ✗   |  ✗   | n/a |
+
+The full pipeline below — write-ahead queue, HMAC-signed webhook delivery, exponential-backoff retry — applies only to the claude harness. The codex harness validates the schema and renders the result in chat, but does not feed the delivery queue.
 
 ### Why
 
@@ -1103,8 +1178,10 @@ src/
     mod.rs             Harness trait, event types, streaming driver
     claude.rs          Claude Code SDK integration (streaming, images, file delivery)
     opencode.rs        OpenCode CLI subprocess harness (JSON event stream, multi-step)
-    gemini.rs          Gemini CLI subprocess harness (stream-json, tool-pairing buffer)
-    codex.rs           Codex harness (planned)
+    gemini.rs          Gemini CLI subprocess harness (stream-json, shared tool-pairing buffer)
+    codex.rs           Codex CLI subprocess harness (NDJSON --json events, paired
+                       item.started/item.completed via shared ToolPairingBuffer,
+                       --full-auto + --skip-git-repo-check unconditional)
   chat_adapters/
     mod.rs             ChatPlatform trait + Attachment type
     telegram.rs        Telegram adapter (teloxide, long-polling)
@@ -1142,7 +1219,7 @@ cmd_tx (mpsc) ──────────> tokio::select! core loop (main.rs)
                             └── Socket per-connection tasks (subscription filtering)
 ```
 
-The harness system is extensible via the `Harness` trait. Claude, OpenCode, and Gemini are fully implemented; Codex has a stub ready for future integration. Each harness supports streaming events (`ToolUse`, `Text`, `File`, `Done`, `Error`) and optional multi-turn session resume.
+The harness system is extensible via the `Harness` trait. Claude, OpenCode, Gemini, and Codex are all fully implemented. Each harness supports streaming events (`ToolUse`, `Text`, `File`, `Done`, `Error`) and optional multi-turn session resume. The gemini and codex harnesses share a `ToolPairingBuffer` (in `harness/mod.rs`) that coalesces paired tool-start + tool-result events keyed by id; the claude SDK and opencode CLI emit atomic tool events and don't need pairing.
 
 ---
 
@@ -1206,6 +1283,24 @@ Opencode must be installed and authenticated: install from [opencode.ai](https:/
 <summary>Gemini commands not working</summary>
 
 Gemini CLI must be installed from [github.com/google-gemini/gemini-cli](https://github.com/google-gemini/gemini-cli) and already authenticated (via its own OAuth / config flow -- terminus does not proxy credentials). Verify with `gemini --help` in your terminal. If terminus can't find it, set `binary_path` in `[harness.gemini]`. Interactive gemini subcommands (`update`, `mcp`, `extensions`, `skills`) are blocked from chat -- run them in your terminal. Use `--approval-mode yolo` (per-prompt or in config) if you want gemini to execute tools without prompting.
+</details>
+
+<details>
+<summary>Codex commands not working</summary>
+
+Codex CLI must be installed (`brew install --cask codex` or `npm install -g @openai/codex`) and authenticated via `codex login` (ChatGPT account or API key). Verify with `codex --version` and `codex login status` in your terminal. If terminus can't find it, set `binary_path` in `[harness.codex]`. Verified against codex-cli **0.125.0** -- newer versions may emit different event schemas (terminus logs a "version drift" warning on unrecognized event types).
+</details>
+
+<details>
+<summary>Codex: "model not supported when using Codex with a ChatGPT account"</summary>
+
+ChatGPT-account auth rejects API-only models (e.g. `gpt-5.5`). Use a ChatGPT-compatible model: `gpt-5.4`, `gpt-5.3-codex`. Set per-prompt with `: codex --model gpt-5.4 ...` or persistently via `[harness.codex] model`.
+</details>
+
+<details>
+<summary>Codex: blocked subcommand error</summary>
+
+All native codex subcommands are blocked from chat in v1 (`login`, `logout`, `mcp`, `cloud`, `apply`, `plugin`, `debug`, `app`, `sessions`, `resume` (bare), `fork`, etc.). Each returns a targeted chat-safe error pointing you at the right path. For named-session resume use the `--resume <name>` flag (e.g. `: codex --resume auth keep going`), not the `: codex resume` subcommand. Run management subcommands in your terminal directly.
 </details>
 
 <details>
