@@ -11,6 +11,7 @@ The opencode harness wraps the `opencode` CLI as a short-lived subprocess per pr
 - [Configuration](#configuration)
 - [Error messages](#error-messages)
 - [Mobile keyboard normalization](#mobile-keyboard-normalization)
+- [Reliability guarantees](#reliability-guarantees)
 - [Testing](#testing)
 
 ---
@@ -182,6 +183,21 @@ Parses identically to:
 ```
 
 En-dash (U+2013) is intentionally NOT normalized — it appears in legitimate prose (e.g., page ranges `5–10`).
+
+---
+
+## Reliability guarantees
+
+The harness mirrors the structural-fix parity from the codex template:
+
+| Guarantee | Mechanism |
+|---|---|
+| Every error path emits a terminal `HarnessEvent::Done` | Spawn-failure, stdout-pipe-missing, panic, idle-timeout, and stdout-read-error paths all fan into a `Done` so socket and chat receivers never hang |
+| Stdout-pipe-missing reaps the child | After `child.kill()`, an explicit `child.wait()` runs so the OS process-table entry is freed (kill_on_drop alone does not call wait) |
+| Stderr is drained concurrently with stdout | A spawned task reads up to 64 KiB of stderr into a buffer in parallel with the stdout JSON loop, preventing pipe-deadlock when opencode writes substantial stderr at the same time as stdout |
+| Mutex poisoning recovers gracefully | `sessions.lock().unwrap_or_else(\|e\| e.into_inner())` so a panic in one session-mutating call doesn't take down subsequent reads |
+
+The validation `missing_binary_emits_error_then_done` pins the spawn-failure invariant; the codex harness has the equivalent battery for its template.
 
 ---
 

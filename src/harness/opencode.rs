@@ -202,6 +202,14 @@ impl Harness for OpencodeHarness {
                 Err(panic_info) => {
                     let msg = format_panic_message(&*panic_info);
                     let _ = event_tx.send(HarnessEvent::Error(msg)).await;
+                    // The panic short-circuited `run_opencode_inner` before
+                    // its own `Done` emission. Send one here so the receiver
+                    // doesn't block forever waiting for a terminal event.
+                    let _ = event_tx
+                        .send(HarnessEvent::Done {
+                            session_id: String::new(),
+                        })
+                        .await;
                     "error"
                 }
             };
@@ -650,6 +658,13 @@ async fn run_opencode_inner(
                 format!("opencode spawn failed: {}", e)
             };
             let _ = event_tx.send(HarnessEvent::Error(msg)).await;
+            // Always emit a terminal Done so the receiver doesn't hang on
+            // any spawn-time failure path.
+            let _ = event_tx
+                .send(HarnessEvent::Done {
+                    session_id: String::new(),
+                })
+                .await;
             return;
         }
     };
@@ -663,10 +678,35 @@ async fn run_opencode_inner(
                 ))
                 .await;
             let _ = child.kill().await;
+            // Reap the (now-killed) child so the process-table entry is freed.
+            // `kill_on_drop` only sends SIGKILL — it does not call `wait()`.
+            let _ = child.wait().await;
+            // Always emit a terminal Done so the receiver doesn't hang.
+            let _ = event_tx
+                .send(HarnessEvent::Done {
+                    session_id: String::new(),
+                })
+                .await;
             return;
         }
     };
-    let stderr = child.stderr.take();
+
+    // Drain stderr concurrently with stdout so opencode doesn't pipe-deadlock
+    // when its stderr buffer fills (~64 KiB on Linux, ~8 KiB on macOS). Without
+    // a concurrent drain, if opencode writes substantial stderr while also
+    // writing stdout, opencode will block on the stderr write — and we'll
+    // block on stdout's `next_line()` waiting for output that never comes.
+    // The 5-minute idle timeout would eventually fire, but the deadlock is
+    // avoidable with one extra task.
+    let stderr_handle: Option<tokio::task::JoinHandle<Vec<u8>>> = child.stderr.take().map(|s| {
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf: Vec<u8> = Vec::new();
+            let mut limited = s.take(64 * 1024);
+            let _ = limited.read_to_end(&mut buf).await;
+            buf
+        })
+    });
 
     let mut reader = BufReader::new(stdout).lines();
     let mut captured_session_id: Option<String> = None;
@@ -812,20 +852,18 @@ async fn run_opencode_inner(
         }
     };
 
+    // Always await the stderr-drain handle (even on success paths) so the
+    // spawned task ends cleanly. The buffered stderr is only used on
+    // non-zero-exit paths but the drain task must run to completion to
+    // avoid a leaked tokio task and a half-open pipe.
+    let raw_stderr_buf: Vec<u8> = match stderr_handle {
+        Some(h) => h.await.unwrap_or_default(),
+        None => Vec::new(),
+    };
+
     if let Some(status) = status {
         if !status.success() {
-            // Read stderr capped at 64 KiB to prevent OOM on crash-looping processes.
-            let raw_stderr = match stderr {
-                Some(s) => {
-                    use tokio::io::AsyncReadExt;
-                    let mut buf = vec![0u8; 0];
-                    let mut limited = s.take(64 * 1024);
-                    let _ = limited.read_to_end(&mut buf).await;
-                    buf
-                }
-                None => Vec::new(),
-            };
-            let stderr_raw = String::from_utf8_lossy(&raw_stderr).trim().to_string();
+            let stderr_raw = String::from_utf8_lossy(&raw_stderr_buf).trim().to_string();
             tracing::debug!("opencode run non-zero exit; raw stderr: {}", stderr_raw);
             let code = status
                 .code()
@@ -1423,6 +1461,57 @@ mod tests {
         assert!(
             matches!(second, HarnessEvent::Done { .. }),
             "expected Done after Error, got {:?}",
+            second
+        );
+    }
+
+    // ── F1 regression: terminal Done on every error path ───────────────────
+
+    /// Spawn-failure (binary not on PATH and no override) MUST emit a terminal
+    /// `HarnessEvent::Done` after `HarnessEvent::Error`. Without it the
+    /// receiver hangs forever waiting for the conventional terminal event.
+    /// Mirrors the codex harness behaviour after F1 / structural-fix parity.
+    #[tokio::test]
+    async fn missing_binary_emits_error_then_done() {
+        let (tx, _rx) = broadcast::channel::<AmbientEvent>(8);
+        let config = OpencodeConfig {
+            // Path that is guaranteed NOT to exist so spawn returns ENOENT.
+            binary_path: Some(std::path::PathBuf::from(
+                "/nonexistent/opencode-binary-for-tests-7c1f",
+            )),
+            ..OpencodeConfig::default()
+        };
+        let h = OpencodeHarness::new(config, tx);
+        let opts = HarnessOptions::default();
+        let cwd = std::env::temp_dir();
+
+        let mut rx = h
+            .run_prompt("hello", &[], &cwd, None, &opts)
+            .await
+            .expect("run_prompt returns receiver");
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("recv timeout: spawn failure should emit fast")
+            .expect("first event must arrive");
+        match first {
+            HarnessEvent::Error(msg) => {
+                assert!(
+                    msg.contains("opencode") && msg.contains("not found"),
+                    "expected binary-not-found error, got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected Error first, got {:?}", other),
+        }
+
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("recv timeout: terminal Done must follow Error")
+            .expect("Done must follow Error");
+        assert!(
+            matches!(second, HarnessEvent::Done { ref session_id } if session_id.is_empty()),
+            "expected Done with empty session_id after spawn failure, got {:?}",
             second
         );
     }

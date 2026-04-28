@@ -34,6 +34,7 @@ Status legend: **Working** = shipped and tested · **Partial** = implemented wit
 | `--model <x>` / `-m <x>` | Working | Per-prompt wins over `[harness.codex].model`. Note: ChatGPT-account auth rejects some models (e.g. `gpt-5.5` → API-only); use `gpt-5.4` or `gpt-5.3-codex` |
 | `--sandbox <x>` | Working | Values: `read-only`, `workspace-write`, `danger-full-access`. Per-prompt wins over `[harness.codex].sandbox` |
 | `--profile <x>` | Working | No `-p` short alias (collides with Claude's `--permission-mode`). Per-prompt wins over `[harness.codex].profile` |
+| `--add-dir <DIR>` / `-d <DIR>` (repeatable) | Working | Forwarded to `codex exec --add-dir <DIR>` to extend the writable sandbox beyond the current `cwd`. Each occurrence appends one flag/value pair, in argv order. Codex 0.125.0+ |
 | `--approval-mode on-request` | Working (rejected) | Codex 0.125.0 has no `--ask-for-approval` flag at all; terminus passes `--full-auto` unconditionally. Passing `--approval-mode on-request` returns a chat-safe error explaining the deadlock risk |
 | `--schema <name>` | Working | Inline JSON or file path. Inline JSON written to a temp file, passed via `codex exec --output-schema <path>`. Validated response is rendered as text (no separate `StructuredOutput` channel) |
 | `--fork` | Working (rejected) | Codex's `fork` is a separate interactive subcommand; not exposed in non-interactive mode. Returns "codex does not support --fork in non-interactive mode" |

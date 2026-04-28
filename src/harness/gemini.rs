@@ -195,12 +195,14 @@ impl Harness for GeminiHarness {
     }
 
     fn get_session_id(&self, session_name: &str) -> Option<String> {
-        let sessions = self.sessions.lock().unwrap();
+        // Recover from poison: another thread panicked while holding the lock,
+        // but the data is still consistent. Mirrors the codex harness handling.
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions.get(session_name).cloned()
     }
 
     fn set_session_id(&self, session_name: &str, session_id: String) {
-        let mut sessions = self.sessions.lock().unwrap();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions.insert(session_name.to_string(), session_id);
     }
 }
@@ -1390,6 +1392,30 @@ mod tests {
         assert!(h.get_session_id("review").is_none());
         h.set_session_id("review", "ses_xyz".to_string());
         assert_eq!(h.get_session_id("review"), Some("ses_xyz".to_string()));
+    }
+
+    /// If a panic poisons the `sessions` mutex, subsequent calls to
+    /// `get_session_id` / `set_session_id` must still succeed (parity with
+    /// `CodexHarness`). A poisoned mutex without recovery would panic on the
+    /// next `lock().unwrap()`, taking down whichever async task touched it.
+    #[test]
+    fn mutex_recovers_from_poison() {
+        let h = Arc::new(empty_harness());
+        h.set_session_id("alpha", "ses_pre".into());
+
+        // Poison the mutex by panicking inside a `lock()` guard's scope.
+        let h_panic = Arc::clone(&h);
+        let result = std::thread::spawn(move || {
+            let _guard = h_panic.sessions.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(result.is_err(), "panic thread should have unwound");
+
+        // Reads and writes must still work despite the poisoned lock.
+        assert_eq!(h.get_session_id("alpha"), Some("ses_pre".into()));
+        h.set_session_id("beta", "ses_post".into());
+        assert_eq!(h.get_session_id("beta"), Some("ses_post".into()));
     }
 
     // ── Arc<GeminiHarness> forwarder ───────────────────────────────────────

@@ -339,6 +339,15 @@ fn build_argv(
         args.push(p.clone());
     }
 
+    // Additional writable directories, repeatable. Codex 0.125.0+ accepts
+    // `--add-dir <DIR>` to extend the sandbox beyond the current cwd.
+    // Sourced from `HarnessOptions.add_dirs` (the same field claude consumes
+    // via `--add-dir`); per-prompt only — no codex-config equivalent yet.
+    for dir in &options.add_dirs {
+        args.push("--add-dir".into());
+        args.push(dir.display().to_string());
+    }
+
     // Image attachments (repeatable).
     for path in attachment_paths {
         args.push("-i".into());
@@ -1196,6 +1205,51 @@ mod tests {
     }
 
     #[test]
+    fn argv_add_dir_flag_repeats_per_directory() {
+        let opts = HarnessOptions {
+            add_dirs: vec![
+                PathBuf::from("/tmp/lib"),
+                PathBuf::from("/tmp/shared"),
+                PathBuf::from("/tmp/extra"),
+            ],
+            ..Default::default()
+        };
+        let args = build_argv("review", None, &opts, &CodexConfig::default(), &[], None);
+        // One `--add-dir` per directory, in order.
+        let positions: Vec<usize> = args
+            .iter()
+            .enumerate()
+            .filter_map(|(i, a)| (a == "--add-dir").then_some(i))
+            .collect();
+        assert_eq!(
+            positions.len(),
+            3,
+            "expected 3 --add-dir flags, got {:?}",
+            args
+        );
+        assert_eq!(args[positions[0] + 1], "/tmp/lib");
+        assert_eq!(args[positions[1] + 1], "/tmp/shared");
+        assert_eq!(args[positions[2] + 1], "/tmp/extra");
+    }
+
+    #[test]
+    fn argv_add_dir_absent_when_options_empty() {
+        let args = build_argv(
+            "hi",
+            None,
+            &HarnessOptions::default(),
+            &CodexConfig::default(),
+            &[],
+            None,
+        );
+        assert!(
+            !args.iter().any(|a| a == "--add-dir"),
+            "no --add-dir expected when add_dirs is empty, got {:?}",
+            args
+        );
+    }
+
+    #[test]
     fn argv_schema_path_passed_via_output_schema() {
         let p = PathBuf::from("/tmp/schema.json");
         let args = build_argv(
@@ -1751,6 +1805,7 @@ mod tests {
             sandbox: Some("read-only".into()),
             profile: Some("dev".into()),
             model: Some("gpt-5.4".into()),
+            add_dirs: vec![PathBuf::from("/tmp/lib")],
             ..Default::default()
         };
         let cfg = CodexConfig {
@@ -1777,6 +1832,7 @@ mod tests {
             "-s",
             "-m",
             "-p",
+            "--add-dir",
             "-i",
             "--output-schema",
             "--ephemeral",

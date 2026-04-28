@@ -77,7 +77,7 @@ Status legend: **Working** = shipped and tested · **Partial** = implemented wit
 | **Attachments** |||
 | Inbound image / file attachments | Not shipped | Rejected with `"gemini: attachments are not yet supported — send text only"` |
 | **Testing** |||
-| Unit tests (deterministic, no external deps) | Working | 54 tests in `harness::gemini` covering `translate_event` for all 6 event types incl. `tool_result.error` object/string variants, `ToolPairingBuffer` incl. capacity eviction, `sanitize_stderr` env-var (upper/lower-case) + home-path redaction + truncation, `build_argv` flag ordering + precedence, ambient-event shape, attachment rejection, schema-redirect |
+| Unit tests (deterministic, no external deps) | Working | 55 tests in `harness::gemini` covering `translate_event` for all 6 event types incl. `tool_result.error` object/string variants, `ToolPairingBuffer` incl. capacity eviction, `sanitize_stderr` env-var (upper/lower-case) + home-path redaction + truncation, `build_argv` flag ordering + precedence, ambient-event shape, attachment rejection, schema-redirect, mutex-poison recovery |
 | `ac1` one-shot streams + completes (live-binary) | Working | Gated by `TERMINUS_HAS_GEMINI=1` |
 | `ac2` interactive two-prompt session reuse (live-binary) | Working | Gated |
 | `ac3` bogus session id surfaces error (live-binary) | Working | Gated |
