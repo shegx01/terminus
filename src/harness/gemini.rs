@@ -257,77 +257,11 @@ fn build_argv(
     args
 }
 
-/// Sanitize a stderr string before forwarding it to chat. Kept pattern-for-
-/// pattern identical to opencode's implementation, with one deliberate
-/// divergence: redaction runs **before** the 500-char truncation so a
-/// sensitive path near the truncation boundary cannot leak a partial prefix.
-///
-/// - Redacts `KEY=value` env-var assignments
-/// - Redacts `/Users/<name>/...` and `/home/<name>/...` paths
-/// - Truncates the redacted result to 500 chars (chat-friendly)
+/// Sanitize gemini stderr before forwarding to chat. Gemini has no benign
+/// noise to pre-filter, so this is a thin pass-through to the shared base
+/// in [`crate::harness::sanitize_stderr_base`].
 pub(crate) fn sanitize_stderr(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while !rest.is_empty() {
-        if let Some(pos) = rest.find('=') {
-            let before = &rest[..pos];
-            // Include both upper and lower alpha in the key scan so lowercase
-            // env-var conventions (e.g. `gemini_api_key=...`) are caught too.
-            // False-positives on prose like `name=hello` are acceptable —
-            // redacting "hello" is visible-only, whereas missing a key leaks
-            // the user's own credentials to the chat log.
-            let key_start = before
-                .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            let key = &before[key_start..];
-            let is_env_key = !key.is_empty()
-                && key.starts_with(|c: char| c.is_ascii_alphabetic())
-                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-
-            if is_env_key {
-                out.push_str(&rest[..key_start]);
-                out.push_str(key);
-                out.push('=');
-                out.push_str("<redacted>");
-                let after_eq = &rest[pos + 1..];
-                let val_end = after_eq
-                    .find(|c: char| c.is_whitespace())
-                    .unwrap_or(after_eq.len());
-                rest = &after_eq[val_end..];
-                continue;
-            }
-
-            out.push_str(&rest[..pos + 1]);
-            rest = &rest[pos + 1..];
-        } else {
-            out.push_str(rest);
-            break;
-        }
-    }
-
-    let patterns: &[(&str, &str)] = &[("/Users/", "/Users/"), ("/home/", "/home/")];
-    let mut result = out;
-    for (needle, prefix) in patterns {
-        if result.contains(needle) {
-            let mut new_result = String::with_capacity(result.len());
-            let mut scan = result.as_str();
-            while let Some(idx) = scan.find(needle) {
-                new_result.push_str(&scan[..idx]);
-                new_result.push_str("<redacted-path>");
-                let after_prefix = &scan[idx + prefix.len()..];
-                let skip = after_prefix
-                    .find('/')
-                    .map(|i| i + 1)
-                    .unwrap_or(after_prefix.len());
-                scan = &after_prefix[skip..];
-            }
-            new_result.push_str(scan);
-            result = new_result;
-        }
-    }
-
-    result.chars().take(500).collect()
+    crate::harness::sanitize_stderr_base(s)
 }
 
 fn format_panic_message(info: &(dyn std::any::Any + Send)) -> String {

@@ -281,6 +281,88 @@ where
     }
 }
 
+/// Sanitize a stderr string before forwarding it to chat. Shared base for the
+/// codex, gemini, and opencode harnesses; each may pre-filter known-benign
+/// log lines via a small per-harness wrapper before calling this.
+///
+/// The transformation pipeline:
+/// 1. **Env-var redaction** — `KEY=value` patterns where `KEY` starts with an
+///    ASCII alphabetic char and contains only `[A-Za-z0-9_]` are replaced
+///    with `KEY=<redacted>`. Values are line-bounded (`\n` / `\r`) rather
+///    than whitespace-bounded so a quoted secret like `KEY='secret with
+///    spaces'` is fully redacted. Slight over-redaction of prose like
+///    `name=hello` is acceptable; the alternative — missing a real key —
+///    leaks credentials into the chat log.
+/// 2. **Absolute-user-path redaction** — `/Users/<name>/…` and `/home/<name>/…`
+///    prefixes are replaced with `<redacted-path>`.
+/// 3. **500-char truncation** — applied last so the redaction can't leak a
+///    partial prefix near the boundary.
+///
+/// The raw content should be logged at `tracing::debug!` by the caller so
+/// operators can diagnose via `RUST_LOG=debug` without shipping raw content.
+pub(crate) fn sanitize_stderr_base(s: &str) -> String {
+    // (1) Env-var redaction.
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while !rest.is_empty() {
+        if let Some(pos) = rest.find('=') {
+            let before = &rest[..pos];
+            let key_start = before
+                .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let key = &before[key_start..];
+            let is_env_key = !key.is_empty()
+                && key.starts_with(|c: char| c.is_ascii_alphabetic())
+                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+
+            if is_env_key {
+                out.push_str(&rest[..key_start]);
+                out.push_str(key);
+                out.push('=');
+                out.push_str("<redacted>");
+                let after_eq = &rest[pos + 1..];
+                // Line-bounded (NOT whitespace-bounded) so quoted values
+                // containing spaces don't leak.
+                let val_end = after_eq.find(['\n', '\r']).unwrap_or(after_eq.len());
+                rest = &after_eq[val_end..];
+                continue;
+            }
+
+            out.push_str(&rest[..pos + 1]);
+            rest = &rest[pos + 1..];
+        } else {
+            out.push_str(rest);
+            break;
+        }
+    }
+
+    // (2) Absolute user-path redaction.
+    let patterns: &[(&str, &str)] = &[("/Users/", "/Users/"), ("/home/", "/home/")];
+    let mut result = out;
+    for (needle, prefix) in patterns {
+        if result.contains(needle) {
+            let mut new_result = String::with_capacity(result.len());
+            let mut scan = result.as_str();
+            while let Some(idx) = scan.find(needle) {
+                new_result.push_str(&scan[..idx]);
+                new_result.push_str("<redacted-path>");
+                let after_prefix = &scan[idx + prefix.len()..];
+                let skip = after_prefix
+                    .find('/')
+                    .map(|i| i + 1)
+                    .unwrap_or(after_prefix.len());
+                scan = &after_prefix[skip..];
+            }
+            new_result.push_str(scan);
+            result = new_result;
+        }
+    }
+
+    // (3) 500-char truncation.
+    result.chars().take(500).collect()
+}
+
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -1104,5 +1186,56 @@ mod tests {
             ToolPairingBuffer::CAP,
             "pending must not exceed CAP"
         );
+    }
+
+    // ── sanitize_stderr_base ─────────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_stderr_base_redacts_uppercase_env_var() {
+        let out = sanitize_stderr_base("API_KEY=sk-abc123 went bad\n");
+        assert!(!out.contains("sk-abc123"), "value leaked: {}", out);
+        assert!(out.contains("API_KEY"));
+    }
+
+    #[test]
+    fn sanitize_stderr_base_redacts_lowercase_env_var() {
+        // Lowercase keys (e.g. `gemini_api_key`) must also be redacted —
+        // codex / gemini both use this convention.
+        let out = sanitize_stderr_base("gemini_api_key=AIzaSy-redact-me\n");
+        assert!(!out.contains("AIzaSy-redact-me"), "value leaked: {}", out);
+        assert!(out.contains("gemini_api_key"));
+    }
+
+    #[test]
+    fn sanitize_stderr_base_redacts_value_through_to_end_of_line() {
+        // A quoted value with embedded whitespace must redact to end-of-line,
+        // not stop at the first space.
+        let out = sanitize_stderr_base("KEY='secret with spaces' next-token\n");
+        assert!(!out.contains("secret with spaces"), "leaked: {}", out);
+    }
+
+    #[test]
+    fn sanitize_stderr_base_redacts_user_path() {
+        let out = sanitize_stderr_base("crash at /Users/alice/code/foo.rs:42");
+        assert!(!out.contains("/Users/alice/"));
+        assert!(out.contains("<redacted-path>"));
+    }
+
+    #[test]
+    fn sanitize_stderr_base_redacts_home_path() {
+        let out = sanitize_stderr_base("/home/bob/proj exploded");
+        assert!(!out.contains("/home/bob/"));
+    }
+
+    #[test]
+    fn sanitize_stderr_base_truncates_to_500_chars() {
+        let long = "x".repeat(800);
+        assert!(sanitize_stderr_base(&long).chars().count() <= 500);
+    }
+
+    #[test]
+    fn sanitize_stderr_base_preserves_safe_content() {
+        let s = "model quota exceeded; try again later";
+        assert_eq!(sanitize_stderr_base(s), s);
     }
 }

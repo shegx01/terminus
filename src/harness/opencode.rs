@@ -291,87 +291,11 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Sanitize a stderr string before forwarding it to chat.
-///
-/// - Truncates to 500 chars (chat-friendly)
-/// - Redacts obvious env-var assignments: `KEY=value` → `KEY=<redacted>`
-/// - Redacts absolute user paths: `/Users/…` and `/home/…` → `<redacted-path>`
-///
-/// The raw content should be logged at `tracing::debug!` by the caller so
-/// operators can diagnose via `RUST_LOG=debug` without shipping raw content.
+/// Sanitize opencode stderr before forwarding to chat. Opencode has no
+/// benign noise to pre-filter, so this is a thin pass-through to the shared
+/// base in [`crate::harness::sanitize_stderr_base`].
 fn sanitize_stderr(s: &str) -> String {
-    // Truncate first to bound further work.
-    let truncated: String = s.chars().take(500).collect();
-
-    // Redact env-var assignments: one or more uppercase letters/digits/underscores
-    // starting with an uppercase letter followed by `=<non-whitespace>`.
-    let mut out = String::with_capacity(truncated.len());
-    let mut rest = truncated.as_str();
-    while !rest.is_empty() {
-        // Scan for `[A-Z][A-Z0-9_]*=` pattern followed by non-whitespace value.
-        if let Some(pos) = rest.find('=') {
-            let before = &rest[..pos];
-            // Walk backwards to find the start of the potential key.
-            let key_start = before
-                .rfind(|c: char| !c.is_ascii_uppercase() && !c.is_ascii_digit() && c != '_')
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            let key = &before[key_start..];
-            // A valid env-var key: starts with uppercase letter, non-empty.
-            let is_env_key = !key.is_empty()
-                && key.starts_with(|c: char| c.is_ascii_uppercase())
-                && key
-                    .chars()
-                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
-
-            if is_env_key {
-                // Emit everything up to and including the key and `=`.
-                out.push_str(&rest[..key_start]);
-                out.push_str(key);
-                out.push('=');
-                out.push_str("<redacted>");
-                // Skip the value (non-whitespace chars after `=`).
-                let after_eq = &rest[pos + 1..];
-                let val_end = after_eq
-                    .find(|c: char| c.is_whitespace())
-                    .unwrap_or(after_eq.len());
-                rest = &after_eq[val_end..];
-                continue;
-            }
-
-            // Not an env-var key — emit up through the `=` and move on.
-            out.push_str(&rest[..pos + 1]);
-            rest = &rest[pos + 1..];
-        } else {
-            out.push_str(rest);
-            break;
-        }
-    }
-
-    // Redact absolute user paths: /Users/<name>/... and /home/<name>/...
-    let patterns: &[(&str, &str)] = &[("/Users/", "/Users/"), ("/home/", "/home/")];
-    let mut result = out;
-    for (needle, prefix) in patterns {
-        if result.contains(needle) {
-            let mut new_result = String::with_capacity(result.len());
-            let mut scan = result.as_str();
-            while let Some(idx) = scan.find(needle) {
-                new_result.push_str(&scan[..idx]);
-                new_result.push_str("<redacted-path>");
-                // Skip past the username component (up to the next `/` or end)
-                let after_prefix = &scan[idx + prefix.len()..];
-                let skip = after_prefix
-                    .find('/')
-                    .map(|i| i + 1) // include the slash after username
-                    .unwrap_or(after_prefix.len());
-                scan = &after_prefix[skip..];
-            }
-            new_result.push_str(scan);
-            result = new_result;
-        }
-    }
-
-    result
+    crate::harness::sanitize_stderr_base(s)
 }
 
 /// Build the argv for a subcommand, mapping user-friendly aliases to the

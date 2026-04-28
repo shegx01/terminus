@@ -471,11 +471,11 @@ impl TempFile {
     }
 }
 
-/// Sanitize a stderr string before forwarding it to chat. Same patterns as
-/// gemini's sanitizer plus codex-specific noise suppression for benign log
-/// lines that codex 0.125.0 emits during normal operation.
+/// Sanitize codex stderr before forwarding it to chat. Strips known-benign
+/// log lines that codex 0.125.0 emits during normal operation, then defers to
+/// the shared base in [`crate::harness::sanitize_stderr_base`] for env-var
+/// and path redaction plus 500-char truncation.
 pub(crate) fn sanitize_stderr(s: &str) -> String {
-    // First pass: strip known-benign codex log lines.
     let filtered: String = s
         .lines()
         .filter(|line| {
@@ -484,68 +484,7 @@ pub(crate) fn sanitize_stderr(s: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-
-    // Second pass: env-var redaction.
-    let mut out = String::with_capacity(filtered.len());
-    let mut rest = filtered.as_str();
-    while !rest.is_empty() {
-        if let Some(pos) = rest.find('=') {
-            let before = &rest[..pos];
-            let key_start = before
-                .rfind(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            let key = &before[key_start..];
-            let is_env_key = !key.is_empty()
-                && key.starts_with(|c: char| c.is_ascii_alphabetic())
-                && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
-
-            if is_env_key {
-                out.push_str(&rest[..key_start]);
-                out.push_str(key);
-                out.push('=');
-                out.push_str("<redacted>");
-                let after_eq = &rest[pos + 1..];
-                // Stop at end-of-line, NOT at first whitespace. A value like
-                // `KEY='secret with spaces'` would otherwise leak the
-                // post-space portion. Over-redacting the rest of the line
-                // is safer than under-redacting a quoted value.
-                let val_end = after_eq.find(['\n', '\r']).unwrap_or(after_eq.len());
-                rest = &after_eq[val_end..];
-                continue;
-            }
-
-            out.push_str(&rest[..pos + 1]);
-            rest = &rest[pos + 1..];
-        } else {
-            out.push_str(rest);
-            break;
-        }
-    }
-
-    // Third pass: redact /Users/x/ and /home/x/ paths.
-    let patterns: &[(&str, &str)] = &[("/Users/", "/Users/"), ("/home/", "/home/")];
-    let mut result = out;
-    for (needle, prefix) in patterns {
-        if result.contains(needle) {
-            let mut new_result = String::with_capacity(result.len());
-            let mut scan = result.as_str();
-            while let Some(idx) = scan.find(needle) {
-                new_result.push_str(&scan[..idx]);
-                new_result.push_str("<redacted-path>");
-                let after_prefix = &scan[idx + prefix.len()..];
-                let skip = after_prefix
-                    .find('/')
-                    .map(|i| i + 1)
-                    .unwrap_or(after_prefix.len());
-                scan = &after_prefix[skip..];
-            }
-            new_result.push_str(scan);
-            result = new_result;
-        }
-    }
-
-    result.chars().take(500).collect()
+    crate::harness::sanitize_stderr_base(&filtered)
 }
 
 fn format_panic_message(info: &(dyn std::any::Any + Send)) -> String {
