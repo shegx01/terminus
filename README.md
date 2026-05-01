@@ -2,7 +2,7 @@
 
 **Drive your terminal from Telegram, Slack, Discord, or any WebSocket client.**
 
-terminus is a single-user Rust programme that bridges tmux sessions to chat
+terminus is a single-user Rust program that bridges tmux sessions to chat
 platforms and a programmatic WebSocket API. Anything you'd do at a
 terminal — deploy a release, tail prod logs, SSH into a box, scroll back
 through output — now works from your phone, a laptop without your dotfiles,
