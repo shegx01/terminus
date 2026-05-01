@@ -38,7 +38,7 @@ pub enum GeminiSubcommand {
     Extensions,
 }
 
-/// Chat-safe codex subcommand surfaces. Codex 0.125.0 has only one read-only
+/// Chat-safe codex subcommand surfaces. Codex 0.128 has only one read-only
 /// top-level surface (`resume --all` exposed as `sessions`), one direct-mutation
 /// surface (`apply <task_id>`), and the experimental `cloud` subgroup (5
 /// single-shot subcommands). Everything else (`login`, `mcp`, `app`, etc.) is
@@ -1217,11 +1217,11 @@ fn parse_harness_options_tokens(
                     return Err(reject_for(kind, "--approval-mode", "gemini"));
                 }
                 let val = get_value!();
-                // Gemini accepts: default | auto_edit | yolo | plan.
-                // Codex 0.125.0 has no `--ask-for-approval` CLI flag at all
-                // (terminus passes `--full-auto` unconditionally). The
+                // Gemini accepts: default | auto_edit | yolo | plan. The
                 // `on-request` value is rejected outright because it would
-                // deadlock the harness with no TTY for prompts.
+                // deadlock the harness with no TTY for prompts. (Codex's
+                // own approval system is unrelated and lives behind
+                // `-s <sandbox>` / permission profiles in 0.128+.)
                 match val.as_str() {
                     "default" | "auto_edit" | "yolo" | "plan" => {
                         gemini_e.approval_mode = Some(val);
@@ -1229,8 +1229,8 @@ fn parse_harness_options_tokens(
                     "on-request" => {
                         return Err(ParseError::InvalidHarnessOption(
                             "--approval-mode on-request would deadlock the harness \
-                             (no TTY for approval prompts) — terminus always passes \
-                             --full-auto instead"
+                             (no TTY for approval prompts) — pick default, auto_edit, \
+                             yolo, or plan instead"
                                 .into(),
                         ));
                     }
@@ -4046,10 +4046,12 @@ mod tests {
 
     #[test]
     fn parse_codex_approval_mode_rejected_cross_harness_redirect() {
-        // F10: `--approval-mode` is codex-rejected at parse time (codex
-        // 0.125.0 has no approval system). The chat-safe error redirects to
-        // gemini; the deadlock-explanation wording lives on the gemini path
-        // now (verified by `parse_gemini_approval_mode_on_request_rejected_with_deadlock_message`).
+        // F10: `--approval-mode` is codex-rejected at parse time. Codex 0.128's
+        // approval/sandbox system lives behind `-s <sandbox>` and permission
+        // profiles, not a `--approval-mode` flag. The chat-safe error
+        // redirects to gemini; the deadlock-explanation wording lives on the
+        // gemini path (verified by
+        // `parse_gemini_approval_mode_on_request_rejected_with_deadlock_message`).
         let err = ParsedCommand::parse(": codex --approval-mode on-request hi", ':').unwrap_err();
         match err {
             ParseError::InvalidHarnessOption(msg) => {

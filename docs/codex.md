@@ -1,6 +1,6 @@
 # codex harness — CLI reference
 
-The codex harness wraps OpenAI's `codex` CLI (`github.com/openai/codex`, verified against codex-cli **0.125.0**) as a short-lived subprocess per prompt. Each invocation spawns `codex exec --json --full-auto --skip-git-repo-check [flags] <prompt>`, streams newline-delimited JSON events from stdout back to chat in real time, and exits cleanly with no persistent sidecar or port binding. Mirrors the `gemini` harness pattern (paired tool-use events via the shared `ToolPairingBuffer`) with codex-specific argv construction.
+The codex harness wraps OpenAI's `codex` CLI (`github.com/openai/codex`, verified against codex-cli **0.128.0**) as a short-lived subprocess per prompt. Each invocation spawns `codex exec --json -s workspace-write --skip-git-repo-check [flags] <prompt>`, streams newline-delimited JSON events from stdout back to chat in real time, and exits cleanly with no persistent sidecar or port binding. Mirrors the `gemini` harness pattern (paired tool-use events via the shared `ToolPairingBuffer`) with codex-specific argv construction.
 
 ## Contents
 
@@ -32,16 +32,16 @@ Status legend: **Working** = shipped and tested · **Partial** = implemented wit
 | `--name <x>` (create-or-resume) | Working | Upsert; internally prefixed `codex:<x>` in the session index |
 | `--resume <x>` / `--continue <x>` (strict resume) | Working | Errors if the named session isn't in the index |
 | Bare `--continue` (continue last) | Working | Translates to `codex exec resume --json … --last <prompt>` |
-| `--model <x>` / `-m <x>` | Working | Per-prompt wins over `[harness.codex].model`. Note: ChatGPT-account auth rejects some models (e.g. `gpt-5.5` → API-only); use `gpt-5.4` or `gpt-5.3-codex` |
-| `--sandbox <x>` | Working | Values: `read-only`, `workspace-write`, `danger-full-access`. Per-prompt wins over `[harness.codex].sandbox` |
+| `--model <x>` / `-m <x>` | Working | Per-prompt wins over `[harness.codex].model`. Default in codex 0.128 is `gpt-5.5`; `gpt-5.4` and `gpt-5.4-mini` are also available. (`gpt-5.3-codex` was removed in 0.128.) |
+| `--sandbox <x>` | Working | Values: `read-only`, `workspace-write`, `danger-full-access`. Per-prompt wins over `[harness.codex].sandbox`. When neither is set, terminus emits `-s workspace-write` as the default (replaces the deprecated-in-0.128 `--full-auto`) |
 | `--profile <x>` | Working | No `-p` short alias (collides with Claude's `--permission-mode`). Per-prompt wins over `[harness.codex].profile` |
-| `--add-dir <DIR>` / `-d <DIR>` (repeatable) | Working | Forwarded to `codex exec --add-dir <DIR>` to extend the writable sandbox beyond the current `cwd`. Each occurrence appends one flag/value pair, in argv order. Codex 0.125.0+ |
-| `--approval-mode on-request` | Working (rejected) | Codex 0.125.0 has no `--ask-for-approval` flag at all; terminus passes `--full-auto` unconditionally. Passing `--approval-mode on-request` returns a chat-safe error explaining the deadlock risk |
+| `--add-dir <DIR>` / `-d <DIR>` (repeatable) | Working | Forwarded to `codex exec --add-dir <DIR>` to extend the writable sandbox beyond the current `cwd`. Each occurrence appends one flag/value pair, in argv order. |
+| `--approval-mode <x>` | Cross-harness reject | Gemini-only flag. `: codex --approval-mode …` returns "`--approval-mode` is only supported by gemini" at parse time (codex 0.128 has no equivalent flag — approvals live behind permission profiles, not a CLI knob) |
 | `--schema <name>` | Working | Three forms: (a) registered name from `[schemas.<name>]` in `terminus.toml`; (b) absolute or cwd-relative file path; (c) inline JSON. All three resolve to a temp file passed via `codex exec --output-schema <path>`. The registered-name form additionally drives the webhook-delivery pipeline (see [Structured output and webhooks](#structured-output-and-webhooks)) |
 | `--fork` | Working (rejected) | Codex's `fork` is a separate interactive subcommand; not exposed in non-interactive mode. Returns "codex does not support --fork in non-interactive mode" |
 | `--title`, `--share`, `--pure`, `--agent` | Working (rejected) | Opencode-only; using one with `: codex` returns a cross-harness redirect error (`"--<flag> is only supported by opencode (you used `: codex`)"`) |
 | **Always-on flags** |||
-| `--full-auto` | Working | Sandboxed automatic execution; replaces the removed `--ask-for-approval` knob |
+| `-s <sandbox>` | Working | Defaults to `workspace-write` when no per-prompt or config value is set (replaces the deprecated `--full-auto` from 0.128). User-supplied `--sandbox` / `[harness.codex].sandbox` overrides |
 | `--skip-git-repo-check` | Working | Tmux cwd may not always be a git repo |
 | `--ephemeral` | Working | Passed when no named/resumed session is active so one-shot prompts don't pollute codex's session log |
 | `--ignore-user-config` | Working (opt-in) | Set via `[harness.codex].ignore_user_config = true` for defense-in-depth against user profiles re-introducing approval prompts |
@@ -86,7 +86,7 @@ Status legend: **Working** = shipped and tested · **Partial** = implemented wit
 | Mutual exclusion: `--name` + `--resume` | Working | Returns "Cannot use both --name and --resume/--continue" |
 | Mutual exclusion: `--name` + `--continue` | Working | Same error |
 | **Stdin discipline** |||
-| `Stdio::null()` for child stdin | Working | Codex 0.125.0 reads stdin even when prompt is supplied as arg; `null` prevents indefinite blocking |
+| `Stdio::null()` for child stdin | Working | `codex exec` reads stdin even when prompt is supplied as arg (still true in 0.128 — codex prints "Reading additional input from stdin..."); `null` prevents indefinite blocking |
 | **Testing** |||
 | Unit tests (deterministic, no external deps) | Working | 44 tests in `harness::codex` covering `build_argv` for fresh/resume/continue with all flag combinations, `translate_event` for every event type, `ToolPairingBuffer` integration, MIME-whitelist enforcement, schema temp-file lifecycle, `sanitize_stderr` for codex-specific noise + env-vars + home paths, panic-message formatting |
 | Command parser tests | Working | `command::tests::parse_codex_*` covers basic prompt, named session, resume, continue, sandbox/profile/model overrides, blocked subcommands, on-request rejection, fork rejection (flag + on form), em-dash normalization, on/off toggles, summary/is_empty regression, the F6+F7 chat-safe subcommand routing surface (sessions / apply / cloud / cloud-{list,status,diff,apply,exec}), and F10 cross-harness flag rejection. Run `cargo test --lib command::tests::parse_codex` for the current list. |
@@ -102,7 +102,7 @@ Status legend: **Working** = shipped and tested · **Partial** = implemented wit
 : codex <prompt>
 ```
 
-Spawns `codex exec --json --full-auto --skip-git-repo-check [flags] <prompt>` as a short-lived child process. No session is persisted unless `--name <x>` is passed; otherwise `--ephemeral` is added so codex doesn't write a session log entry.
+Spawns `codex exec --json -s workspace-write --skip-git-repo-check [flags] <prompt>` as a short-lived child process. No session is persisted unless `--name <x>` is passed; otherwise `--ephemeral` is added so codex doesn't write a session log entry. The `-s workspace-write` default replaces the deprecated `--full-auto` from codex 0.128 — user-supplied `--sandbox` or `[harness.codex].sandbox` overrides it.
 
 ### Interactive toggle
 
@@ -129,11 +129,11 @@ All flags work in both one-shot (`: codex --name foo <prompt>`) and on-toggle (`
 | `--name <x>` | session name | Create-or-resume by name | (terminus-internal) |
 | `--resume <x>` / `--continue <x>` | session name | Strict resume; errors if name unknown | `exec resume <thread_id>` |
 | `--continue` (bare) | (none) | Continue most recent codex session | `exec resume --last` |
-| `--model <x>` / `-m <x>` | e.g. `gpt-5.4`, `gpt-5.3-codex` | Override model | `-m <model>` |
+| `--model <x>` / `-m <x>` | e.g. `gpt-5.5` (default in 0.128), `gpt-5.4`, `gpt-5.4-mini` | Override model | `-m <model>` |
 | `--sandbox <x>` | `read-only` \| `workspace-write` \| `danger-full-access` | Override sandbox policy | `-s <sandbox>` |
 | `--profile <x>` | profile name | Select named profile from `~/.codex/config.toml` | `-p <profile>` |
 | `--schema <x>` | registered name, file path, or inline JSON | Validate response shape; registered names also drive webhook delivery | `--output-schema <path>` (resolved value written to temp) |
-| `--approval-mode on-request` | (rejected) | Returns chat-safe deadlock error | n/a — codex 0.125.0 has no equivalent flag |
+| `--approval-mode on-request` | (rejected) | Cross-harness reject: gemini-only flag (`: gemini` path also rejects `on-request` with the deadlock-explanation wording) | n/a — codex 0.128 has no equivalent CLI flag; approvals live behind permission profiles |
 | `--fork` | (rejected) | Returns "not supported in non-interactive mode" | n/a |
 
 ### Mutual exclusion
@@ -145,7 +145,7 @@ All flags work in both one-shot (`: codex --name foo <prompt>`) and on-toggle (`
 
 ## Chat-safe subcommands
 
-The following codex 0.125.0 subcommands are exposed in chat. Each is a single-shot subprocess (30s timeout, output truncated at 3000 chars inside a fenced code block):
+The following codex subcommands (verified against codex 0.128) are exposed in chat. Each is a single-shot subprocess (30s timeout, output truncated at 3000 chars inside a fenced code block):
 
 | Chat invocation | Codex CLI mapping | Notes |
 |---|---|---|
@@ -161,7 +161,7 @@ Bare `: codex cloud` (no recognized sub-word) returns a help message listing the
 
 ## Blocked subcommands
 
-Every other codex 0.125.0 subcommand returns a chat-safe error so users can't accidentally invoke an interactive surface from chat:
+Every other codex 0.128 subcommand returns a chat-safe error so users can't accidentally invoke an interactive surface from chat:
 
 | Subcommand | Chat-safe error |
 |---|---|
@@ -176,7 +176,7 @@ Every other codex 0.125.0 subcommand returns a chat-safe error so users can't ac
 
 ## Event schema
 
-Codex emits newline-delimited JSON events on stdout when invoked with `--json`. Verified against codex-cli 0.125.0 via direct spike runs (`.omc/research/codex-events-fresh.ndjson`, `codex-events-tooluse.ndjson`).
+Codex emits newline-delimited JSON events on stdout when invoked with `--json`. Event schema verified against codex-cli 0.125.0 spike (`.omc/research/codex-events-fresh.ndjson`, `codex-events-tooluse.ndjson`); re-verified compatible against 0.128.
 
 ```json
 {"type":"thread.started","thread_id":"019dcf4d-aaaa-7777-bbbb-cccccccccccc"}
@@ -207,7 +207,7 @@ max_named_sessions = 50          # shared with Claude / opencode / gemini / code
 
 [harness.codex]
 binary_path = "/opt/homebrew/bin/codex"   # default: resolved via PATH
-model = "gpt-5.4"                          # default: codex's own default
+model = "gpt-5.5"                          # default: codex's own default (gpt-5.5 in 0.128)
 profile = "default"                        # default: codex's own active profile
 sandbox = "workspace-write"                # default: codex's own default
 ignore_user_config = false                 # opt-in: skip ~/.codex/config.toml
@@ -217,10 +217,10 @@ All fields are optional. When omitted, terminus resolves `codex` from PATH and i
 
 ### Defaults applied unconditionally by terminus (NOT configurable):
 
-- `--full-auto` — replaces the removed `--ask-for-approval` knob; codex 0.125.0 has no other way to skip TTY approval prompts.
+- `-s workspace-write` — applied when no per-prompt or config sandbox value is set. Replaces the deprecated-in-0.128 `--full-auto` (codex prints a deprecation warning if `--full-auto` is used). `codex exec` is non-interactive by default in 0.128, so no separate "skip TTY approval" flag is needed.
 - `--skip-git-repo-check` — terminus's tmux cwd may not always be a git repo.
 - `--ephemeral` — added when no named/resumed session is active.
-- `Stdio::null()` for child stdin — codex 0.125.0 reads stdin even when prompt is supplied as an arg, blocking forever without this.
+- `Stdio::null()` for child stdin — `codex exec` reads stdin even when prompt is supplied as an arg (still true in 0.128), blocking forever without this.
 
 ### `--cd / -C <path>` is intentionally NOT passed
 
@@ -287,7 +287,7 @@ All error strings the harness can return to chat (not exhaustive — common cate
 | stdout pipe | `"codex: stdout pipe missing"` |
 | Idle timeout | `"codex: no output for 5 minutes — killing subprocess"` |
 | Non-zero exit | `"codex exited with status 1: <sanitized stderr>"` |
-| Approval mode | `"--approval-mode on-request would deadlock the harness (no TTY for approval prompts) — terminus always passes --full-auto instead"` |
+| Approval mode (gemini) | `"--approval-mode on-request would deadlock the harness (no TTY for approval prompts) — pick default, auto_edit, yolo, or plan instead"` (this path is gemini-only after F10; `: codex --approval-mode …` is rejected up-front as a cross-harness flag) |
 | Sandbox | `"Invalid --sandbox '<x>' — expected read-only, workspace-write, or danger-full-access"` |
 | Attachment | `"codex: only image attachments supported (got <mime> — allowed: image/png, image/jpeg, image/jpg, image/webp)"` |
 | Schema | `"codex: --schema is neither a file path nor valid JSON: <parse error>"` |
@@ -328,11 +328,11 @@ The codex harness has 44 deterministic unit tests + 20 command-parser tests, non
 
 - **Cloud surface is single-shot only.** `: codex cloud {list,status,diff,apply,exec}` and `: codex apply <task_id>` are wired (F7) — each maps to one short-lived subprocess. The submit-then-apply lifecycle is two independent CLI calls; terminus does not retain task state between them. Use `: codex cloud list` / `cloud status <task_id>` to track tasks.
 - **`cloud exec` timeout caveat.** All chat-safe codex subcommands share a 30s wall-clock timeout. `cloud exec` submits a task to a remote environment and the network round-trip can occasionally approach that bound. If `cloud exec` returns "timed out after 30s", the task's submission status is **unknown** — the request may have reached the cloud successfully even though terminus didn't see the task ID. Confirm with `: codex cloud list` before re-submitting; rerunning a successful submission will create a duplicate task.
-- **Interactive subcommands stay blocked.** `: codex resume` (picker UI), `: codex fork` (picker UI), `: codex review` (interactive review flow), `: codex models` (no top-level surface in 0.125.0) — all blocked at the parser. Named-session resume still works via the `--resume <name>` flag, independent of codex's `resume` subcommand.
+- **Interactive subcommands stay blocked.** `: codex resume` (picker UI), `: codex fork` (picker UI), `: codex review` (interactive review flow), `: codex models` (no top-level surface in codex 0.128) — all blocked at the parser. Named-session resume still works via the `--resume <name>` flag, independent of codex's `resume` subcommand.
 - **`reasoning` items dropped silently.** When codex emits `item.completed { type: "reasoning" }`, terminus drops it without surfacing to chat. Surfacing reasoning would create noisy chat output; revisit if users ask.
 - **Token usage from `turn.completed.usage` not surfaced to chat.** Parity with gemini, where `result` event stats are also unsurfaced today.
 - **Image-only attachment whitelist.** `image/png`, `image/jpeg`, `image/jpg`, `image/webp` only. HEIC, PDF, video, etc. are rejected with chat-safe errors. Multimodal expansion deferred.
 - **Inline-JSON and file-path `--schema` forms render as `HarnessEvent::Text` only.** They never feed the webhook pipeline — that is reserved for registered names from `[schemas.<name>]` so the HMAC secret env var lookup is registry-driven (see [Structured output and webhooks](#structured-output-and-webhooks)).
-- **`gpt-5.5` rejected with ChatGPT auth.** Codex's default model on a ChatGPT account run won't accept `gpt-5.5` (API-only). Use `gpt-5.4` or `gpt-5.3-codex` via `--model` or `[harness.codex].model`.
+- **Default model is `gpt-5.5`** as of codex 0.128 (priority 0 in the bundled manifest at `codex-rs/models-manager/models.json`). It is universally available — including on ChatGPT-account auth — and replaces `gpt-5.3-codex` (which was removed in 0.128). `gpt-5.4` and `gpt-5.4-mini` remain available for `--model` overrides.
 - **Stderr ERROR lines are benign.** The `failed to record rollout items: thread <id> not found` line is filtered automatically by `sanitize_stderr` and does not propagate to chat. Same for `Reading additional input from stdin...` (only appears if stdin redirection regresses).
 - **Cross-harness session-name persist failure (terminus-wide).** State file persists one entry per key; the `codex:` prefix prevents collisions with other harnesses, but a write-failure mode shared with opencode/gemini is documented in CLAUDE.md as a known limitation. Not codex-specific.

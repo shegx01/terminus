@@ -1,24 +1,33 @@
 //! Codex CLI-subprocess harness.
 //!
-//! Wraps OpenAI's `codex` CLI (verified against codex-cli 0.125.0) — each
+//! Wraps OpenAI's `codex` CLI (verified against codex-cli 0.128.0) — each
 //! prompt spawns `codex exec --json` (or `codex exec resume --json …` for
 //! continuation) as a short-lived child process. Mirrors the structure of
 //! [`crate::harness::gemini`] and [`crate::harness::opencode`] with codex-
 //! specific argv construction and event translation.
 //!
-//! ## Codex 0.125.0 ground truth (verified by spike)
+//! ## Codex 0.128.0 ground truth (verified by spike)
 //!
-//! - **Approval flag removed.** Codex no longer accepts `--ask-for-approval`;
-//!   terminus passes `--full-auto` unconditionally so the harness never blocks
-//!   on a TTY approval prompt that has nowhere to be answered.
+//! - **Approval flag absent on `exec`.** `codex exec` does not accept
+//!   `--ask-for-approval` (it's a top-level-only flag). `codex exec` is
+//!   non-interactive by default in 0.128, so no replacement is needed —
+//!   the harness just pins the sandbox explicitly with `-s <value>`.
+//! - **`--full-auto` is deprecated.** Codex 0.128 prints
+//!   `"--full-auto is deprecated; use --sandbox workspace-write instead"`
+//!   on stderr if used. Terminus emits `-s workspace-write` instead (or
+//!   the user's per-prompt / config sandbox value when set), avoiding both
+//!   the deprecation warning and the future-removal risk.
 //! - **`--skip-git-repo-check`** is always passed because terminus's tmux cwd
 //!   may not be a git repo.
 //! - **`--ephemeral`** is passed when no named session is in play, so one-shot
 //!   prompts don't pollute codex's session log.
-//! - **stdin must be `Stdio::null()`** — codex 0.125.0 reads stdin even when
+//! - **stdin must be `Stdio::null()`** — `codex exec` reads stdin even when
 //!   the prompt is supplied as a positional arg, and the read blocks forever
 //!   if a TTY isn't attached.
 //! - **`--ignore-user-config`** is opt-in via `[harness.codex] ignore_user_config`.
+//! - **Default model is `gpt-5.5`** as of codex 0.128 (priority 0 in the
+//!   bundled model manifest). `gpt-5.4` and `gpt-5.4-mini` remain available;
+//!   `gpt-5.3-codex` was removed.
 //!
 //! ## Event schema (NDJSON, one JSON object per line)
 //!
@@ -509,13 +518,15 @@ impl Harness for CodexHarness {
 /// `session_id` is the *resolved* codex thread_id (or `None` for fresh).
 ///
 /// Branches:
-/// - Fresh prompt: `codex exec --json --full-auto --skip-git-repo-check [...] -- <prompt>`
-/// - Resume by id: `codex exec resume --json --full-auto --skip-git-repo-check [...] <session_id> <prompt>`
+/// - Fresh prompt: `codex exec --json -s workspace-write --skip-git-repo-check [...] -- <prompt>`
+/// - Resume by id: `codex exec resume --json -s workspace-write --skip-git-repo-check [...] <session_id> <prompt>`
 /// - Bare --continue: `codex exec resume --json [...] --last <prompt>`
 ///
 /// **Always-on flags** (cannot be overridden by user options):
-/// - `--full-auto` (codex 0.125.0 has no `--ask-for-approval`; this is the
-///   non-interactive default that doesn't deadlock).
+/// - `-s <sandbox>` — defaults to `workspace-write` when no user/config value
+///   is set. Replaces the deprecated-in-0.128 `--full-auto` flag (`codex exec`
+///   no longer accepts `--ask-for-approval` and runs non-interactively by
+///   default; the explicit sandbox value avoids the deprecation warning).
 /// - `--skip-git-repo-check` (terminus's tmux cwd may not be a git repo).
 /// - `--ignore-user-config` if `config.ignore_user_config = true`.
 /// - `--ephemeral` when no named/resumed session is active (one-shot prompts).
@@ -536,35 +547,41 @@ fn build_argv(
     }
 
     args.push("--json".into());
-    args.push("--full-auto".into());
     args.push("--skip-git-repo-check".into());
 
     if config.ignore_user_config {
         args.push("--ignore-user-config".into());
     }
 
-    // Sandbox: per-prompt > config > codex default.
-    // Validate the value here so a bad TOML setting (e.g. `sandbox = "banana"`)
-    // doesn't reach codex with a malformed flag — the parser already validates
-    // per-prompt values, but config-sourced values bypass the parser. Drop +
-    // log on invalid values so codex gets a clean argv (and falls back to its
-    // own default).
+    // Sandbox: per-prompt > config > workspace-write fallback.
+    //
+    // Codex 0.128 deprecated `--full-auto` in favor of explicit
+    // `-s <sandbox>`. `codex exec` runs non-interactively by default in 0.128
+    // (no `--ask-for-approval` flag exists on the exec subcommand), so we just
+    // need to pin the sandbox. `workspace-write` matches the deprecated
+    // `--full-auto` behavior — write access to the current workspace, no
+    // network, no parent-dir reads.
+    //
+    // Config-sourced values bypass the parser, so validate here too: drop +
+    // log on invalid input rather than emitting a malformed flag.
     const VALID_SANDBOX: &[&str] = &["read-only", "workspace-write", "danger-full-access"];
     let codex_e = options.codex_extras();
     let effective_sandbox = codex_e
         .and_then(|c| c.sandbox.as_ref())
         .or(config.sandbox.as_ref());
-    if let Some(s) = effective_sandbox {
-        if VALID_SANDBOX.contains(&s.as_str()) {
-            args.push("-s".into());
-            args.push(s.clone());
-        } else {
+    let sandbox_value: &str = match effective_sandbox {
+        Some(s) if VALID_SANDBOX.contains(&s.as_str()) => s.as_str(),
+        Some(s) => {
             tracing::warn!(
                 value = %s,
-                "codex: invalid sandbox value in config (valid: read-only, workspace-write, danger-full-access); using codex default"
+                "codex: invalid sandbox value in config (valid: read-only, workspace-write, danger-full-access); falling back to workspace-write"
             );
+            "workspace-write"
         }
-    }
+        None => "workspace-write",
+    };
+    args.push("-s".into());
+    args.push(sandbox_value.into());
 
     // Model: per-prompt > config > codex default.
     let effective_model = options.model.as_ref().or(config.model.as_ref());
@@ -582,8 +599,8 @@ fn build_argv(
         args.push(p.clone());
     }
 
-    // Additional writable directories, repeatable. Codex 0.125.0+ accepts
-    // `--add-dir <DIR>` to extend the sandbox beyond the current cwd.
+    // Additional writable directories, repeatable. `codex exec --add-dir <DIR>`
+    // extends the sandbox beyond the current cwd (verified through 0.128).
     // Sourced from `HarnessOptions.add_dirs` (the same field claude consumes
     // via `--add-dir`); per-prompt only — no codex-config equivalent yet.
     for dir in &options.add_dirs {
@@ -840,7 +857,7 @@ impl TempFile {
 }
 
 /// Sanitize codex stderr before forwarding it to chat. Strips known-benign
-/// log lines that codex 0.125.0 emits during normal operation, then defers to
+/// log lines that the codex CLI emits during normal operation, then defers to
 /// the shared base in [`crate::harness::sanitize_stderr_base`] for env-var
 /// and path redaction plus 500-char truncation.
 pub(crate) fn sanitize_stderr(s: &str) -> String {
@@ -887,8 +904,10 @@ async fn run_codex_inner(
         .current_dir(&cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        // CRITICAL: codex 0.125.0 reads stdin even when prompt is supplied as
-        // an arg. Pin stdin to /dev/null or it blocks indefinitely.
+        // CRITICAL: `codex exec` reads stdin even when prompt is supplied as
+        // a positional arg (still true in 0.128 — codex prints "Reading
+        // additional input from stdin..." before continuing). Pin stdin to
+        // /dev/null or it blocks indefinitely.
         .stdin(Stdio::null())
         .kill_on_drop(true);
 
@@ -1462,13 +1481,29 @@ mod tests {
     // ── build_argv ──────────────────────────────────────────────────────────
 
     #[test]
-    fn argv_fresh_prompt_passes_full_auto_and_skip_git_repo_check() {
+    fn argv_fresh_prompt_passes_workspace_write_and_skip_git_repo_check() {
+        // Codex 0.128 deprecated `--full-auto` in favor of `-s <sandbox>`. With
+        // no per-prompt or config sandbox set, terminus pins
+        // `-s workspace-write` (the same effective behavior as the deprecated
+        // `--full-auto`) to avoid the deprecation warning on stderr.
         let opts = HarnessOptions::default();
         let cfg = CodexConfig::default();
         let args = build_argv("hello", None, &opts, &cfg, &[], None);
         assert_eq!(args[0], "exec");
         assert!(args.contains(&"--json".to_string()));
-        assert!(args.contains(&"--full-auto".to_string()));
+        assert!(
+            !args.contains(&"--full-auto".to_string()),
+            "--full-auto is deprecated; expected -s workspace-write instead. argv: {:?}",
+            args
+        );
+        let s_pos = args
+            .iter()
+            .position(|a| a == "-s")
+            .expect("expected -s flag in argv");
+        assert_eq!(
+            args.get(s_pos + 1).map(String::as_str),
+            Some("workspace-write")
+        );
         assert!(args.contains(&"--skip-git-repo-check".to_string()));
         assert!(args.contains(&"--ephemeral".to_string()));
         assert_eq!(args.last().unwrap(), "hello");
@@ -2239,7 +2274,6 @@ mod tests {
             .position(|a| a == "describe")
             .expect("prompt present");
         for flag in [
-            "--full-auto",
             "--skip-git-repo-check",
             "--ignore-user-config",
             "-s",
@@ -2297,10 +2331,19 @@ mod tests {
         );
     }
 
-    // ── Fix #8: invalid sandbox in config dropped ──────────────────────────
+    // ── Fix #8 (post-0.128): invalid sandbox in config falls back to default ─
+    //
+    // Behavior change rationale: codex 0.128 deprecated `--full-auto` in favor
+    // of explicit `-s <sandbox>`, and `codex exec` now requires a sandbox value
+    // for the non-interactive default to be applied. Previously terminus would
+    // drop the `-s` flag entirely on an invalid value and rely on `--full-auto`
+    // to provide the default. With `--full-auto` gone, an invalid config value
+    // must fall back to the explicit `workspace-write` default rather than
+    // emit no `-s` flag at all (which would leave codex in its own default,
+    // currently `read-only`-equivalent in 0.128).
 
     #[test]
-    fn argv_invalid_sandbox_in_config_dropped_with_warning() {
+    fn argv_invalid_sandbox_in_config_falls_back_to_workspace_write() {
         let cfg = CodexConfig {
             sandbox: Some("banana".into()),
             ..Default::default()
@@ -2311,18 +2354,24 @@ mod tests {
             "invalid sandbox must NOT appear in argv; got {:?}",
             args
         );
-        assert!(
-            !args.iter().any(|a| a == "-s"),
-            "no -s flag should be passed when sandbox value is invalid; got {:?}",
+        let s_pos = args
+            .iter()
+            .position(|a| a == "-s")
+            .expect("expected -s flag with workspace-write fallback; got {:?}");
+        assert_eq!(
+            args.get(s_pos + 1).map(String::as_str),
+            Some("workspace-write"),
+            "invalid value should fall back to workspace-write; got {:?}",
             args
         );
     }
 
     #[test]
-    fn argv_invalid_sandbox_in_options_per_prompt_path_unaffected() {
+    fn argv_invalid_sandbox_in_options_per_prompt_falls_back() {
         // Per-prompt sandbox is validated by the parser, not build_argv. If
         // somehow an invalid value reaches build_argv via options (bypassing
-        // the parser), it should also be dropped — defense in depth.
+        // the parser), it should also fall back to workspace-write — defense
+        // in depth.
         let opts = HarnessOptions {
             extras: Some(HarnessExtras::Codex(CodexExtras {
                 sandbox: Some("not-a-real-policy".into()),
@@ -2332,6 +2381,16 @@ mod tests {
         };
         let args = build_argv("hi", None, &opts, &CodexConfig::default(), &[], None);
         assert!(!args.iter().any(|a| a == "not-a-real-policy"));
+        let s_pos = args
+            .iter()
+            .position(|a| a == "-s")
+            .expect("expected -s flag with fallback");
+        assert_eq!(
+            args.get(s_pos + 1).map(String::as_str),
+            Some("workspace-write"),
+            "invalid options.sandbox should fall back; got {:?}",
+            args
+        );
     }
 
     // ── Fix #4 + #7: handle_schema validation + directory error ────────────
