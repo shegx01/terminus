@@ -97,8 +97,7 @@ Set `TERMINUS_CONFIG=/path/to/config.toml` to use a non-default config location.
 : screen                  # snapshot the terminal screen
 ```
 
-**Claude Code** — uses your Claude Pro/Max subscription, not API credits.
-Structured typed output, real-time tool activity, image input, named
+**Claude Code** — Structured typed output, real-time tool activity, image input, named
 sessions:
 
 ```
