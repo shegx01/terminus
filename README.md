@@ -1,17 +1,28 @@
 # terminus
 
-**Control your terminal and AI agents from Telegram, Slack, Discord, or any WebSocket client.**
+**Drive your terminal from Telegram, Slack, Discord, or any WebSocket client.**
 
-terminus is a single-user Rust bot that bridges tmux sessions and AI harnesses
-(Claude, Codex, Gemini, opencode) to chat platforms and a programmatic
-WebSocket API. Run shell commands, manage sessions, send images, and hold
-multi-turn AI conversations — from your phone or from code.
+terminus is a single-user Rust bot that bridges tmux sessions to chat
+platforms and a programmatic WebSocket API. Anything you'd do at a
+terminal — deploy a release, tail prod logs, kick off a long build, SSH into
+a box, scroll back through output — you can now do from your phone, from a
+laptop without your dotfiles, or from a script. If you can pipe it through
+tmux, you can drive it from chat.
 
 ```
-: new dev
-: cargo build --release
+: new prod
+: ssh api-1 'docker logs -f web'      # tail prod logs from your phone
+: cargo build --release               # kick off a long build, walk away
+: screen                              # snapshot the terminal back to chat
+```
+
+Layered on top: optional AI harnesses (Claude, Codex, Gemini, opencode) with
+named sessions, image input, structured output, and live tool-use streaming.
+
+```
 : claude on --name auth --model sonnet
 What does the auth module do?
+[send a screenshot] what's wrong with this error?
 ```
 
 ---
