@@ -27,3 +27,4 @@ pub mod state_persistor;
 pub mod state_store;
 pub mod structured_output;
 pub mod tmux;
+pub mod wake;
