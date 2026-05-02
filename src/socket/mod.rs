@@ -1,8 +1,11 @@
 //! WebSocket bidirectional API for terminus.
-// Items in the socket module are used exclusively from the binary target
-// (src/main.rs). The library target (src/lib.rs) compiles this module for
-// `cargo test --lib` but does not use any socket API, so private and
-// pub(crate) items appear dead to the library compiler.
+// Items in the socket module are used by the binary target (src/main.rs)
+// and — since the integration-test PR — by the test crate at
+// tests/socket_lifecycle.rs. The library target (src/lib.rs) compiles
+// this module for `cargo test --lib` but does not call any socket API
+// itself, so private and pub(crate) items still appear dead from the
+// library's perspective. The crate-level allow keeps the compile clean
+// without scattering per-item attributes.
 #![allow(dead_code)]
 //!
 //! Exposes an authenticated, pipelined, subscription-capable WebSocket
@@ -16,11 +19,13 @@
 //!   2. New `broadcast::channel<AmbientEvent>` for genuinely-new events
 //!   3. Existing `mpsc::Sender<IncomingMessage>` for inbound command dispatch
 
-// Socket submodules are used exclusively by the binary (src/main.rs via
-// `mod socket;`). The library target (src/lib.rs) includes them for
-// `cargo test --lib` but does not call any socket API itself, so all
-// pub(crate) items appear dead from the library's perspective.
-// The allow(dead_code) on each submodule suppresses those false positives.
+// Socket submodules. `SocketServer`, `SubscriptionStoreInner`, and the
+// `SharedSubscriptionStore` type alias are intentionally `pub` because
+// `tests/socket_lifecycle.rs` constructs a real server on an ephemeral
+// port — `pub(crate)` would be invisible to that test crate. Every other
+// submodule item stays `pub(crate)` (preserved by the `mod imp` wrap).
+// The library-target dead-code suppression below covers items that look
+// dead from the lib perspective but are reachable from main.rs/tests.
 //
 // `events` stays unconditional because the ambient-event bus (AmbientEvent
 // type) is referenced from `app.rs` and the harnesses regardless of whether
@@ -142,7 +147,7 @@ mod imp {
         /// Upsert subscriptions for `client_name`, bumping to most-recently-used.
         /// If the store is at capacity and `client_name` is new, the LRU entry is
         /// evicted first.
-        pub fn save(&mut self, client_name: String, subs: Vec<(String, Filter)>) {
+        pub(crate) fn save(&mut self, client_name: String, subs: Vec<(String, Filter)>) {
             if self.map.contains_key(&client_name) {
                 // Bump: remove from current position, push to back.
                 self.order.retain(|k| k != &client_name);
@@ -159,7 +164,7 @@ mod imp {
         }
 
         /// Look up subscriptions for `client_name`, bumping to most-recently-used.
-        pub fn restore(&mut self, client_name: &str) -> Option<&Vec<(String, Filter)>> {
+        pub(crate) fn restore(&mut self, client_name: &str) -> Option<&Vec<(String, Filter)>> {
             if self.map.contains_key(client_name) {
                 // Bump to most-recently-used position.
                 self.order.retain(|k| k != client_name);
@@ -171,7 +176,7 @@ mod imp {
         }
 
         /// Remove a client's subscriptions entirely (e.g. on unsubscribe or config removal).
-        pub fn remove(&mut self, client_name: &str) {
+        pub(crate) fn remove(&mut self, client_name: &str) {
             if self.map.remove(client_name).is_some() {
                 self.order.retain(|k| k != client_name);
             }
@@ -179,7 +184,7 @@ mod imp {
 
         /// Purge all clients whose names are not in `retained`. Called after a
         /// config hot-reload that removed one or more `[[socket.client]]` entries.
-        pub fn purge_clients(&mut self, retained: &std::collections::HashSet<String>) {
+        pub(crate) fn purge_clients(&mut self, retained: &std::collections::HashSet<String>) {
             let to_remove: Vec<String> = self
                 .map
                 .keys()
@@ -194,7 +199,7 @@ mod imp {
 
         /// Number of clients currently in the store.
         #[allow(dead_code)]
-        pub fn len(&self) -> usize {
+        pub(crate) fn len(&self) -> usize {
             self.map.len()
         }
 
@@ -222,6 +227,24 @@ mod imp {
     }
 
     impl SocketServer {
+        /// Construct a new socket server.
+        ///
+        /// # Preconditions (callers from outside the binary, e.g. tests)
+        ///
+        /// - `cancel` must NOT already be cancelled — `run` would exit
+        ///   immediately on the first poll.
+        /// - `stream_tx` and `ambient_tx` broadcast senders must outlive
+        ///   `run`; otherwise per-request and ambient subscribers receive
+        ///   `RecvError::Closed`.
+        /// - `cmd_tx`'s receiver must remain open; a dropped receiver
+        ///   silently discards every inbound socket command.
+        /// - `shared_clients` may be empty (auth gate rejects all 401);
+        ///   when populated, every `SocketClient.token` should be at
+        ///   least 32 characters — the same minimum `Config::validate`
+        ///   enforces. A `debug_assert!` checks this in test builds.
+        ///
+        /// `run()` consumes `self` and must be called at most once. Concurrent
+        /// invocation is undefined.
         #[allow(clippy::too_many_arguments)]
         pub fn new(
             config: SocketConfig,
@@ -233,6 +256,16 @@ mod imp {
             shared_clients: SharedClientList,
             shared_subs: SharedSubscriptionStore,
         ) -> Self {
+            // Mirror the `Config::validate` 32-char-minimum invariant so a
+            // direct `SocketServer::new` call cannot bypass it. Test-builds
+            // panic immediately; release builds skip this check (the auth
+            // gate's `constant_time_eq` still rejects mismatches at the
+            // request level).
+            debug_assert!(
+                shared_clients.load().iter().all(|c| c.token.len() >= 32),
+                "every SocketClient.token must be at least 32 characters \
+                 (matching Config::validate's minimum)"
+            );
             Self {
                 config,
                 cmd_tx,

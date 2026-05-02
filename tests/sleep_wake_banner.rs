@@ -1,11 +1,14 @@
 //! Integration tests for the sleep/wake gap-banner pipeline.
 //!
-//! Covers the architecture-review path: power_rx -> handle_gap -> banner
-//! emission -> per-platform delivery -> ack resolution -> inline-prefix
-//! fallback. End-to-end through the real `App` event flow with a mock
-//! `ChatPlatform` standing in for Telegram/Slack/Discord.
+//! Covers: power_rx -> handle_gap -> banner emission -> per-platform
+//! delivery -> ack resolution -> inline-prefix fallback. End-to-end
+//! through the real `App` event flow with `MockPlatform`.
+//!
+//! NOTE: `FakePowerManager` and `gap_detector.rs` are covered by their
+//! own unit tests in `src/power/{fake,gap_detector}.rs`; these
+//! integration tests drive `App::handle_gap` directly to keep timing
+//! deterministic and avoid spinning up a real supervisor loop.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -14,37 +17,34 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use terminus::buffer::StreamEvent;
-use terminus::chat_adapters::{ChatPlatform, IncomingMessage};
-use terminus::delivery::spawn_delivery_task;
+use terminus::chat_adapters::IncomingMessage;
 use terminus::power::types::PowerSignal;
 use terminus::state_store::StateUpdate;
 
 mod common;
 
-use common::fixtures::test_app;
-use common::mocks::MockPlatform;
+use common::fixtures::{
+    subscribe_stream, test_app, wire_telegram_blocking_mock, wire_telegram_mock,
+};
+use common::mocks::MockEvent;
+
+// Synthetic chat IDs used across tests. Distinct values per test so a
+// future cross-test assertion can't accidentally collide.
+const CHAT_BASIC: i64 = 7777;
+const CHAT_BLOCKING: i64 = 8888;
+const CHAT_ORDERING: i64 = 2222;
+const CHAT_PAYLOAD: i64 = 3333;
+const CHATS_MULTI: [i64; 3] = [1001, 1002, 1003];
 
 #[tokio::test]
 async fn gap_banner_emitted_after_wake() {
     let dir = tempdir().unwrap();
     let (mut app, _state_rx) = test_app(dir.path());
 
-    // Seed a Telegram chat through the public StateUpdate path so the
-    // active-chat set is populated without poking private fields.
-    app.apply_state_update(StateUpdate::BindTelegramChat(7777))
+    app.apply_state_update(StateUpdate::BindTelegramChat(CHAT_BASIC))
         .await;
+    let mock = wire_telegram_mock(&mut app);
 
-    // Wire a MockPlatform in via set_platforms + spawn the production
-    // delivery task so banners get actually delivered (not just emitted).
-    let mock = MockPlatform::telegram();
-    let dyn_mock: Arc<dyn ChatPlatform> = mock.clone();
-    let stream_rx = app.subscribe_stream();
-    let acks = app.pending_banner_acks_handle();
-    let prefixes = app.gap_prefix_handle();
-    spawn_delivery_task(Arc::clone(&dyn_mock), stream_rx, acks, prefixes);
-    app.set_platforms(Some(dyn_mock), None, None, None, None);
-
-    // Trigger handle_gap with a 90s gap.
     let signal = PowerSignal::GapDetected {
         paused_at: Utc::now() - chrono::Duration::seconds(90),
         resumed_at: Utc::now(),
@@ -55,10 +55,10 @@ async fn gap_banner_emitted_after_wake() {
         .await
         .expect("handle_gap should complete within 2s");
 
-    // The mock should have received exactly one send_message — the banner.
-    // Allow a brief grace period for the broadcast event to reach the
-    // delivery task.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // No `tokio::time::sleep` grace period needed: handle_gap awaits the
+    // banner-ack oneshot, which the delivery task only resolves AFTER
+    // send_message completes and pushes to messages_sent. By the time
+    // handle_gap returns, the snapshot is already populated.
     let snap = mock.snapshot().await;
     assert_eq!(
         snap.messages_sent.len(),
@@ -67,39 +67,34 @@ async fn gap_banner_emitted_after_wake() {
         snap.messages_sent
     );
     let (chat_id, text) = &snap.messages_sent[0];
-    assert_eq!(chat_id, "7777", "banner routed to wrong chat");
+    assert_eq!(
+        chat_id,
+        &CHAT_BASIC.to_string(),
+        "banner routed to wrong chat"
+    );
     assert!(
         text.contains("paused at") && text.contains("resumed at"),
         "banner text should mention paused/resumed; got: {text:?}"
     );
-
-    // Adapters were paused and resumed exactly once each as part of the
-    // wake sequence.
-    let (paused, resumed) = mock.pause_resume_counts().await;
-    assert_eq!(paused, 1, "pause should fire once before banner emission");
-    assert_eq!(resumed, 1, "resume should fire once after banner ack");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn gap_banner_inline_fallback_on_ack_timeout() {
-    // When the delivery task can't send the banner within 5s, handle_gap
-    // falls back to inserting an inline-prefix in `gap_prefix`. We exercise
-    // this by using a `telegram_blocking` mock whose send_message blocks
-    // forever — the ack oneshot never fires, the timeout path engages, and
-    // a `GapInfo` should be retrievable via `consume_gap_prefix`.
+    // The banner-ack oneshot inside `App::handle_gap` has a 5s timeout
+    // (see `src/app.rs::handle_gap`). When the platform's `send_message`
+    // never returns, the ack never fires, the timeout engages, and a
+    // `GapInfo` is stashed in `gap_prefix` for inline-prefix fallback.
+    //
+    // `start_paused = true` makes the tokio time driver virtual: the 5s
+    // wait completes in microseconds via `tokio::time::advance`. Without
+    // this, the test would consume real wall-clock time and fragile
+    // under loaded CI runners.
     let dir = tempdir().unwrap();
     let (mut app, _state_rx) = test_app(dir.path());
 
-    app.apply_state_update(StateUpdate::BindTelegramChat(8888))
+    app.apply_state_update(StateUpdate::BindTelegramChat(CHAT_BLOCKING))
         .await;
-
-    let mock = MockPlatform::telegram_blocking();
-    let dyn_mock: Arc<dyn ChatPlatform> = mock.clone();
-    let stream_rx = app.subscribe_stream();
-    let acks = app.pending_banner_acks_handle();
-    let prefixes = app.gap_prefix_handle();
-    spawn_delivery_task(Arc::clone(&dyn_mock), stream_rx, acks, prefixes);
-    app.set_platforms(Some(dyn_mock), None, None, None, None);
+    let mock = wire_telegram_blocking_mock(&mut app);
 
     let signal = PowerSignal::GapDetected {
         paused_at: Utc::now() - chrono::Duration::seconds(120),
@@ -108,21 +103,36 @@ async fn gap_banner_inline_fallback_on_ack_timeout() {
     };
     let (cmd_tx, _cmd_rx) = mpsc::channel::<IncomingMessage>(16);
 
-    // The 5s ack timeout inside handle_gap means this should complete in
-    // ~5s. Cap at 8s for safety.
-    timeout(Duration::from_secs(8), app.handle_gap(signal, cmd_tx))
-        .await
-        .expect("handle_gap should complete within the ack-timeout window");
+    // Drive handle_gap into the ack-timeout path on a separate task while
+    // we advance the virtual clock past 5s.
+    let handle = tokio::spawn(async move {
+        app.handle_gap(signal, cmd_tx).await;
+        app
+    });
 
-    // The blocking mock never produced a `send_message` snapshot entry.
+    // Yield once so the spawned task gets a chance to install the ack
+    // oneshot and enter `tokio::time::timeout(5s, ...)`. Then jump past
+    // the timeout.
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(6)).await;
+
+    // The handle_gap future must have returned (timeout fired). 8s is
+    // an upper bound on the virtual-time advance; `advance` is
+    // synchronous, so this should resolve immediately.
+    let app = timeout(Duration::from_secs(8), handle)
+        .await
+        .expect("handle_gap should complete after virtual time advance")
+        .expect("spawned task should not panic");
+
+    // The blocking mock should have NO recorded sends.
     let snap = mock.snapshot().await;
     assert!(
         snap.messages_sent.is_empty(),
         "blocking mock should not have recorded any send"
     );
 
-    // The fallback path should have stashed a GapInfo for chat 8888.
-    let prefix = app.consume_gap_prefix("8888").await;
+    // The fallback path should have stashed a GapInfo for the chat.
+    let prefix = app.consume_gap_prefix(&CHAT_BLOCKING.to_string()).await;
     assert!(
         prefix.is_some(),
         "consume_gap_prefix should yield a fallback entry after ack timeout"
@@ -130,24 +140,20 @@ async fn gap_banner_inline_fallback_on_ack_timeout() {
 }
 
 #[tokio::test]
-async fn multi_chat_gap_banners_emitted_in_parallel() {
-    // Three telegram chats: each should get its own banner concurrently
-    // (handle_gap awaits all per-chat oneshot ACKs in parallel).
+async fn multi_chat_gap_banners_all_delivered() {
+    // Three telegram chats. Verifies every active chat receives a banner.
+    // Does NOT prove parallel delivery — `handle_gap` emits banners
+    // sequentially on a single broadcast channel; the only "parallel"
+    // aspect is `join_all` over per-chat ack oneshots. Naming has been
+    // adjusted to match what the assertion actually proves.
     let dir = tempdir().unwrap();
     let (mut app, _state_rx) = test_app(dir.path());
 
-    for id in [1001i64, 1002, 1003] {
+    for id in CHATS_MULTI {
         app.apply_state_update(StateUpdate::BindTelegramChat(id))
             .await;
     }
-
-    let mock = MockPlatform::telegram();
-    let dyn_mock: Arc<dyn ChatPlatform> = mock.clone();
-    let stream_rx = app.subscribe_stream();
-    let acks = app.pending_banner_acks_handle();
-    let prefixes = app.gap_prefix_handle();
-    spawn_delivery_task(Arc::clone(&dyn_mock), stream_rx, acks, prefixes);
-    app.set_platforms(Some(dyn_mock), None, None, None, None);
+    let mock = wire_telegram_mock(&mut app);
 
     let signal = PowerSignal::GapDetected {
         paused_at: Utc::now() - chrono::Duration::seconds(60),
@@ -159,45 +165,39 @@ async fn multi_chat_gap_banners_emitted_in_parallel() {
         .await
         .expect("handle_gap should complete within 2s");
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
     let snap = mock.snapshot().await;
     assert_eq!(
         snap.messages_sent.len(),
-        3,
-        "expected three banner messages (one per chat), got: {:?}",
+        CHATS_MULTI.len(),
+        "expected one banner per chat, got: {:?}",
         snap.messages_sent
     );
-    let mut chat_ids: Vec<&str> = snap
+    let mut chat_ids: Vec<String> = snap
         .messages_sent
         .iter()
-        .map(|(id, _)| id.as_str())
+        .map(|(id, _)| id.clone())
         .collect();
     chat_ids.sort();
+    let mut expected: Vec<String> = CHATS_MULTI.iter().map(|id| id.to_string()).collect();
+    expected.sort();
     assert_eq!(
-        chat_ids,
-        vec!["1001", "1002", "1003"],
+        chat_ids, expected,
         "every active chat should receive its own banner"
     );
 }
 
 #[tokio::test]
-async fn gap_banner_pause_precedes_send() {
-    // Validate the pause-then-emit ordering: the platform must observe a
-    // pause() call BEFORE the first send_message arrives. handle_gap
-    // pauses adapters first, then broadcasts GapBanner, then awaits acks.
+async fn gap_banner_emits_pause_then_send_then_resume_in_order() {
+    // True ordering proof using `MockPlatformState::event_log` — counters
+    // alone (`pause=1, send=1, resume=1`) would be satisfied by any
+    // permutation. This test asserts the strict pause -> send -> resume
+    // sequence the production wake-recovery sequence relies on.
     let dir = tempdir().unwrap();
     let (mut app, _state_rx) = test_app(dir.path());
 
-    app.apply_state_update(StateUpdate::BindTelegramChat(2222))
+    app.apply_state_update(StateUpdate::BindTelegramChat(CHAT_ORDERING))
         .await;
-
-    let mock = MockPlatform::telegram();
-    let dyn_mock: Arc<dyn ChatPlatform> = mock.clone();
-    let stream_rx = app.subscribe_stream();
-    let acks = app.pending_banner_acks_handle();
-    let prefixes = app.gap_prefix_handle();
-    spawn_delivery_task(Arc::clone(&dyn_mock), stream_rx, acks, prefixes);
-    app.set_platforms(Some(dyn_mock), None, None, None, None);
+    let mock = wire_telegram_mock(&mut app);
 
     let signal = PowerSignal::GapDetected {
         paused_at: Utc::now() - chrono::Duration::seconds(45),
@@ -209,34 +209,46 @@ async fn gap_banner_pause_precedes_send() {
         .await
         .expect("handle_gap should complete");
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
     let snap = mock.snapshot().await;
-    // pause must have been called, banner must have been sent, resume must
-    // have been called — all in that order.
-    assert_eq!(snap.pause_count, 1);
-    assert_eq!(snap.messages_sent.len(), 1);
-    assert_eq!(snap.resume_count, 1);
+    let log = &snap.event_log;
+    let pause_idx = log
+        .iter()
+        .position(|e| matches!(e, MockEvent::Paused))
+        .expect("MockEvent::Paused must appear in the log");
+    let send_idx = log
+        .iter()
+        .position(|e| matches!(e, MockEvent::Sent { .. }))
+        .expect("MockEvent::Sent must appear in the log");
+    let resume_idx = log
+        .iter()
+        .position(|e| matches!(e, MockEvent::Resumed))
+        .expect("MockEvent::Resumed must appear in the log");
+
+    assert!(
+        pause_idx < send_idx,
+        "Paused must come BEFORE Sent in the event log; got {log:?}"
+    );
+    assert!(
+        send_idx < resume_idx,
+        "Sent must come BEFORE Resumed in the event log; got {log:?}"
+    );
 }
 
 #[tokio::test]
-async fn gap_banner_uses_stream_event_payload() {
-    // Verify that the GapBanner StreamEvent payload carries paused_at,
-    // resumed_at, gap, and platform fields. This is a contract test for the
-    // event schema downstream consumers (e.g. socket subscribers) rely on.
+async fn gap_banner_stream_event_carries_signal_fields() {
+    // Contract test for the wire schema: the `StreamEvent::GapBanner`
+    // payload carries paused_at, resumed_at, gap, and chat_id. Socket
+    // subscribers and downstream consumers depend on this contract.
     let dir = tempdir().unwrap();
     let (mut app, _state_rx) = test_app(dir.path());
 
-    app.apply_state_update(StateUpdate::BindTelegramChat(3333))
+    app.apply_state_update(StateUpdate::BindTelegramChat(CHAT_PAYLOAD))
         .await;
 
-    let mut stream_rx = app.subscribe_stream();
-    let mock = MockPlatform::telegram();
-    let dyn_mock: Arc<dyn ChatPlatform> = mock.clone();
-    let delivery_stream = app.subscribe_stream();
-    let acks = app.pending_banner_acks_handle();
-    let prefixes = app.gap_prefix_handle();
-    spawn_delivery_task(Arc::clone(&dyn_mock), delivery_stream, acks, prefixes);
-    app.set_platforms(Some(dyn_mock), None, None, None, None);
+    // Pre-subscribe to the stream BEFORE wiring the mock, so the test
+    // sees the GapBanner event before the delivery task consumes it.
+    let mut stream_rx = subscribe_stream(&app);
+    let _mock = wire_telegram_mock(&mut app);
 
     let paused_at = Utc::now() - chrono::Duration::seconds(75);
     let resumed_at = Utc::now();
@@ -253,32 +265,35 @@ async fn gap_banner_uses_stream_event_payload() {
         app
     });
 
-    // Pull StreamEvents until we see a GapBanner. The same event stream
-    // also carries any other events emitted during the test, so loop until
-    // we hit the right kind.
+    // Pull StreamEvents until we see a GapBanner. Lagged broadcast
+    // receivers can return Err — those are non-fatal, so we retry rather
+    // than panic.
     let banner = timeout(Duration::from_secs(2), async {
         loop {
             match stream_rx.recv().await {
                 Ok(StreamEvent::GapBanner {
                     chat_id,
-                    paused_at,
-                    resumed_at,
-                    gap,
+                    paused_at: pa,
+                    resumed_at: ra,
+                    gap: g,
                     ..
-                }) => return (chat_id, paused_at, resumed_at, gap),
+                }) => return (chat_id, pa, ra, g),
                 Ok(_) => continue,
-                Err(_) => panic!("broadcast channel closed before banner"),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("broadcast channel closed before banner")
+                }
             }
         }
     })
     .await
     .expect("gap banner should be emitted");
 
-    assert_eq!(banner.0, "3333");
-    assert_eq!(banner.3, gap);
-    // Paused/resumed timestamps are forwarded directly from the signal.
-    assert_eq!(banner.1, paused_at);
-    assert_eq!(banner.2, resumed_at);
+    let (banner_chat_id, banner_paused_at, banner_resumed_at, banner_gap) = banner;
+    assert_eq!(banner_chat_id, CHAT_PAYLOAD.to_string());
+    assert_eq!(banner_gap, gap);
+    assert_eq!(banner_paused_at, paused_at);
+    assert_eq!(banner_resumed_at, resumed_at);
 
     let _ = handle_task.await;
 }

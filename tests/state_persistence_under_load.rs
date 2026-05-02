@@ -8,11 +8,15 @@
 //!    debounce window). A burst of 100 updates must result in all 100
 //!    landing on disk.
 //!
-//! 2. Crash-mid-batch must recover to the last successfully persisted state.
-//!    The atomic `tempfile + rename + fsync` pattern in `StateStore::persist`
-//!    means that if the process dies between two batched persists, the on-
-//!    disk state reflects the LAST successful persist — never an interleaved
-//!    half-write.
+//! 2. The debounce threshold (>= 10 updates) must trigger a persist on
+//!    the boundary update. The previous `crash_mid_batch_recovers_to_last_persist`
+//!    test was renamed (R1-P0) — `drop(app)` is a deterministic destructor,
+//!    not a real OS-level crash, so the test can only verify "force-persist
+//!    completes synchronously before apply returns," not crash-safety.
+//!    True crash-safety (atomic rename under SIGKILL) requires filesystem
+//!    fault injection and is out of scope.
+
+#![allow(unused_imports)] // mpsc kept for symmetry with other test files
 
 use std::time::Duration;
 
@@ -31,10 +35,6 @@ async fn force_persist_watermarks_dont_lose_updates_under_burst() {
     let dir = tempdir().unwrap();
     let (mut app, mut state_rx) = test_app(dir.path());
 
-    // Spawn a worker that drains state_rx and applies updates back to the
-    // app (mirroring the production main-loop behavior). This forces the
-    // SlackWatermark variants through `apply_state_update` which is where
-    // force-persist lives.
     let state_path = dir.path().join("terminus-state.json");
     const N: usize = 100;
     for i in 0..N {
@@ -46,8 +46,7 @@ async fn force_persist_watermarks_dont_lose_updates_under_burst() {
     }
 
     // Reload from disk: every channel watermark must be present and equal
-    // to the value we wrote (force-persist bypasses debounce, so each
-    // update is durable immediately).
+    // to the value we wrote (force-persist bypasses debounce).
     let reloaded = StateStore::load(&state_path).expect("reload state");
     let snap = reloaded.snapshot();
     assert_eq!(
@@ -66,8 +65,8 @@ async fn force_persist_watermarks_dont_lose_updates_under_burst() {
         );
     }
 
-    // Drain any debounced state updates that escaped the apply loop so we
-    // don't leave dangling channel work for the test runtime.
+    // Drain any debounced state updates that escaped so the test runtime
+    // doesn't have dangling channel work.
     let _ = timeout(Duration::from_millis(50), async {
         while state_rx.try_recv().is_ok() {}
     })
@@ -75,16 +74,20 @@ async fn force_persist_watermarks_dont_lose_updates_under_burst() {
 }
 
 #[tokio::test]
-async fn crash_mid_batch_recovers_to_last_persist() {
-    // Apply some force-persisted updates, then "crash" by dropping the
-    // store without calling persist() again. Reload from disk and verify
-    // the state matches the last force-persist boundary — never partial.
+async fn force_persist_completes_before_apply_returns() {
+    // Renamed from `crash_mid_batch_recovers_to_last_persist` (R1-P0).
+    // Rust's `drop(app)` is a deterministic synchronous destructor, NOT a
+    // process crash — the OS would have to be killed mid-`write`/`rename`
+    // to actually exercise atomic-rename crash-safety, which we cannot do
+    // from a unit/integration test. What this test PROVES is that the
+    // force-persist variants (`SlackWatermark` / `DiscordWatermark`) are
+    // durable on disk before `apply_state_update` returns, regardless of
+    // what later in-memory state the test mutates.
     let dir = tempdir().unwrap();
     let state_path = dir.path().join("terminus-state.json");
 
     {
         let (mut app, _state_rx) = test_app(dir.path());
-        // Three force-persisted watermarks (each writes durably).
         app.apply_state_update(StateUpdate::SlackWatermark {
             channel_id: "C001".to_string(),
             ts: "1.000000".to_string(),
@@ -100,80 +103,79 @@ async fn crash_mid_batch_recovers_to_last_persist() {
             ts: "2.000000".to_string(),
         })
         .await;
-        // Now apply 5 non-force-persist updates — these are batched and
-        // will NOT be on disk when the app drops.
+        // Apply 5 non-force-persist updates afterward. These are batched
+        // and may not be on disk when the app drops (depends on the
+        // debounce threshold).
         for i in 0..5 {
             app.apply_state_update(StateUpdate::TelegramOffset(1000 + i as i64))
                 .await;
         }
-        // App drops without graceful shutdown — simulates a crash.
+        // App drops without graceful shutdown.
     }
 
-    // Reload: expect the three force-persisted watermarks to be present.
-    // The 5 non-force telegram-offset updates may or may not have made it
-    // to disk depending on debounce timing, but the watermark invariants
-    // must hold either way.
+    // The three force-persisted watermarks must be on disk.
     let reloaded = StateStore::load(&state_path).expect("reload state");
     let snap = reloaded.snapshot();
     assert_eq!(
         snap.slack_watermarks.get("C001").map(String::as_str),
         Some("1.000000"),
-        "first slack watermark should survive the crash"
+        "first slack watermark must be persisted before apply returns"
     );
     assert_eq!(
         snap.slack_watermarks.get("C002").map(String::as_str),
         Some("2.000000"),
-        "second slack watermark should survive the crash"
+        "second slack watermark must be persisted before apply returns"
     );
     assert_eq!(
         snap.discord_watermarks.get("D001").copied(),
         Some(42),
-        "discord watermark should survive the crash"
+        "discord watermark must be persisted before apply returns"
     );
 }
 
 #[tokio::test]
-async fn debounced_persist_eventually_lands_after_threshold() {
-    // Drive 11 non-force updates through apply_state_update — the 10th
-    // crosses the debounce threshold, forcing a persist. Reload and
-    // confirm the latest TelegramOffset is on disk.
+async fn debounced_persist_lands_at_threshold() {
+    // The 10th non-force update crosses the >= 10 threshold and triggers
+    // a persist that includes the last-applied value (1_000_009 — the
+    // 10th increment of the starting offset). The 11th update is applied
+    // in memory but not persisted before drop.
+    //
+    // Tightened from `>= 1_000_009` (R1-P1): the boundary semantic is
+    // exactly 1_000_009, not "at least." Looser comparisons would mask
+    // a regression that persists too eagerly (e.g. on every update).
     let dir = tempdir().unwrap();
     let state_path = dir.path().join("terminus-state.json");
 
-    let (mut app, _state_rx) = test_app(dir.path());
-    for i in 0..11 {
-        app.apply_state_update(StateUpdate::TelegramOffset(1_000_000 + i as i64))
-            .await;
+    {
+        let (mut app, _state_rx) = test_app(dir.path());
+        for i in 0..11 {
+            app.apply_state_update(StateUpdate::TelegramOffset(1_000_000 + i as i64))
+                .await;
+        }
+        // App drops here.
     }
-    // The 10th update triggered the threshold; the 11th was applied after
-    // the persist. The on-disk file should reflect at LEAST the 10th
-    // value.
-    drop(app);
 
     let reloaded = StateStore::load(&state_path).expect("reload state");
     let snap = reloaded.snapshot();
-    assert!(
-        snap.telegram.offset >= 1_000_009,
-        "expected debounced persist to capture at least update #10; got telegram_offset = {}",
+    assert_eq!(
+        snap.telegram.offset, 1_000_009,
+        "debounced persist should capture the 10th update exactly (1_000_009); \
+         got telegram.offset = {}",
         snap.telegram.offset
     );
 }
 
 #[tokio::test]
 async fn mark_clean_shutdown_persists_immediately() {
-    // SetCleanShutdown is force-persisted. Apply it and reload to verify
-    // last_clean_shutdown flips to true on disk.
     let dir = tempdir().unwrap();
     let state_path = dir.path().join("terminus-state.json");
     let (mut app, _state_rx) = test_app(dir.path());
 
-    // App::new sets last_clean_shutdown to false (MarkDirty). Confirm by
-    // reloading first.
     {
         let early = StateStore::load(&state_path).expect("reload");
         assert!(
             !early.snapshot().last_clean_shutdown,
-            "App::new should leave last_clean_shutdown = false"
+            "App::new should leave last_clean_shutdown = false (MarkDirty)"
         );
     }
 
@@ -185,7 +187,3 @@ async fn mark_clean_shutdown_persists_immediately() {
         "mark_clean_shutdown should force-persist last_clean_shutdown = true"
     );
 }
-
-// Silence an unused-import warning when the file is checked alone.
-#[allow(dead_code)]
-fn _drain_helper(_rx: &mut mpsc::Receiver<()>) {}
