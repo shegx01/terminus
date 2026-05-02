@@ -14,6 +14,7 @@ mod state_persistor;
 mod state_store;
 mod structured_output;
 mod tmux;
+mod wake;
 
 use std::sync::Arc;
 use std::time::Duration;

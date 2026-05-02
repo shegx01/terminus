@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Duration;
 
 use anyhow::Result;
-#[cfg(feature = "slack")]
-use chrono::DateTime;
+#[cfg(test)]
 use chrono::Utc;
 use tokio::sync::{broadcast, mpsc};
 
@@ -30,6 +30,7 @@ use crate::state_store::NamedSessionEntry;
 use crate::state_store::{StateStore, StateUpdate};
 use crate::structured_output::{spawn_retry_worker, DeliveryQueue, SchemaRegistry, WebhookClient};
 use crate::tmux::TmuxClient;
+use crate::wake::{WakeCoordinator, WakeDispatchContext};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // App
@@ -67,21 +68,16 @@ pub struct App {
     /// mpsc sender to push `StateUpdate`s into the App's `state_rx` channel.
     /// Kept here so `App` itself can send updates (e.g. `MarkDirty`, `Tick`).
     state_tx: mpsc::Sender<StateUpdate>,
-    /// Active Telegram chat IDs (hydrated from persisted state on startup).
-    active_telegram_chats: HashSet<i64>,
-    /// Active Slack channel IDs (hydrated from persisted state on startup).
-    active_slack_chats: HashSet<String>,
-    /// Active Discord channel IDs (hydrated from persisted state on startup).
-    active_discord_chats: HashSet<String>,
+    /// Wake/sleep recovery coordinator. Owns the active-chat sets per
+    /// platform and the `startup_was_clean` flag. Runs the gap-banner
+    /// and catchup orchestration on `PowerSignal::GapDetected` and at
+    /// startup. See `src/wake.rs`.
+    wake: WakeCoordinator,
     /// Banner-ack and inline-prefix coordinator. Owns the `pending_banner_acks`
     /// and `gap_prefix` shared maps; runs the install/await/fallback dance
     /// for `handle_gap`. See `src/banner.rs` for the extracted state machine
     /// and concurrency contract.
     banner: BannerCoordinator,
-    /// Snapshot of `last_clean_shutdown` from the state file *before* we
-    /// applied `MarkDirty` on startup.  Used by `emit_startup_gap_banners`
-    /// to check whether the previous run exited cleanly.
-    startup_was_clean: bool,
 
     // ── Structured output ─────────────────────────────────────────────────────
     schema_registry: Arc<SchemaRegistry>,
@@ -131,9 +127,15 @@ impl App {
         let active_slack_chats: HashSet<String> = snapshot.chats.slack.iter().cloned().collect();
         let active_discord_chats: HashSet<String> =
             snapshot.chats.discord.iter().cloned().collect();
-        // Capture this BEFORE applying MarkDirty, so emit_startup_gap_banners
+        // Capture this BEFORE applying MarkDirty, so the wake coordinator
         // knows whether the *previous* run exited cleanly.
         let startup_was_clean = snapshot.last_clean_shutdown;
+        let wake = WakeCoordinator::new(
+            active_telegram_chats,
+            active_slack_chats,
+            active_discord_chats,
+            startup_was_clean,
+        );
         let named_harness_sessions = snapshot.harness_sessions.clone();
         let legacy_count = named_harness_sessions
             .keys()
@@ -187,11 +189,8 @@ impl App {
             trigger,
             state_persistor,
             state_tx,
-            active_telegram_chats,
-            active_slack_chats,
-            active_discord_chats,
+            wake,
             banner: BannerCoordinator::new(),
-            startup_was_clean,
             schema_registry: Arc::clone(&schema_registry),
             delivery_queue: Arc::clone(&delivery_queue),
             webhook_client: Arc::clone(&webhook_client),
@@ -364,74 +363,14 @@ impl App {
 
     /// Emit gap banners for any active chats if we detect an unclean restart
     /// with a wall gap > 30s.  Call this once after `reconcile_startup()`.
-    pub fn emit_startup_gap_banners(&mut self) {
-        let snapshot = self.state_persistor.snapshot().clone();
-        let now = Utc::now();
-        let last_seen = match snapshot.last_seen_wall {
-            Some(t) => t,
-            None => return, // first ever run — no gap
-        };
-        let wall_gap = now
-            .signed_duration_since(last_seen)
-            .to_std()
-            .unwrap_or(Duration::ZERO);
-
-        // Only fire if the gap exceeds 30s AND last shutdown was not clean.
-        // Use `startup_was_clean` (captured before MarkDirty) rather than the
-        // current store value (which is always false after MarkDirty).
-        if wall_gap <= Duration::from_secs(30) || self.startup_was_clean {
-            return;
-        }
-
-        let chat_count = self.active_telegram_chats.len()
-            + self.active_slack_chats.len()
-            + self.active_discord_chats.len();
-        if chat_count == 0 {
-            return;
-        }
-
-        tracing::info!(
-            "Detected unclean restart — emitting gap banners for {} chat(s) \
-             (gap={:.0}s, paused_at={}, resumed_at={})",
-            chat_count,
-            wall_gap.as_secs_f64(),
-            last_seen,
-            now,
-        );
-
-        // Emit one GapBanner per active Telegram chat.
-        for &chat_id in &self.active_telegram_chats {
-            let _ = self.stream_tx.send(StreamEvent::GapBanner {
-                chat_id: chat_id.to_string(),
-                platform: PlatformType::Telegram,
-                paused_at: last_seen,
-                resumed_at: now,
-                gap: wall_gap,
-                missed_count: 0,
-            });
-        }
-        // Emit one GapBanner per active Slack chat.
-        for chat_id in &self.active_slack_chats {
-            let _ = self.stream_tx.send(StreamEvent::GapBanner {
-                chat_id: chat_id.clone(),
-                platform: PlatformType::Slack,
-                paused_at: last_seen,
-                resumed_at: now,
-                gap: wall_gap,
-                missed_count: 0,
-            });
-        }
-        // Emit one GapBanner per active Discord chat.
-        for chat_id in &self.active_discord_chats {
-            let _ = self.stream_tx.send(StreamEvent::GapBanner {
-                chat_id: chat_id.clone(),
-                platform: PlatformType::Discord,
-                paused_at: last_seen,
-                resumed_at: now,
-                gap: wall_gap,
-                missed_count: 0,
-            });
-        }
+    /// Pass-through to [`WakeCoordinator::emit_startup_gap_banners`].
+    /// Takes `&self` because the migrated logic doesn't mutate App state —
+    /// the chat sets and `startup_was_clean` flag inside the wake coordinator
+    /// are read, not written, on this path.
+    pub fn emit_startup_gap_banners(&self) {
+        let last_seen_wall = self.state_persistor.snapshot().last_seen_wall;
+        self.wake
+            .emit_startup_gap_banners(last_seen_wall, &self.stream_tx);
     }
 
     /// Handle a `PowerSignal::GapDetected`: pause polling, broadcast a
@@ -447,178 +386,32 @@ impl App {
     ///
     /// Callers pass `cmd_tx.clone()` so only platform-adapter senders and
     /// actively-running catchup tasks keep the channel alive.
-    pub async fn handle_gap(&mut self, signal: PowerSignal, cmd_tx: mpsc::Sender<IncomingMessage>) {
-        // `cmd_tx` is consumed only when the slack feature is compiled in
-        // (discord catchup spawns a task that captures other state). The
-        // explicit reference suppresses the unused-variable warning for
-        // builds that disable slack — covers all current and future
-        // feature-combo permutations without a stale `cfg_attr`.
-        let _ = &cmd_tx;
-        let PowerSignal::GapDetected {
-            paused_at,
-            resumed_at,
-            gap,
-        } = signal;
-
-        // 1. Pause all adapters via trait method.
-        for p in [&self.telegram, &self.slack, &self.discord]
-            .into_iter()
-            .flatten()
-        {
-            p.pause().await;
-        }
-        tracing::info!(
-            "Adapters paused for gap handling \
-             (paused_at={}, resumed_at={}, gap={:.0}s)",
-            paused_at,
-            resumed_at,
-            gap.as_secs_f64()
-        );
-
-        // 2. Broadcast a GapBanner and wait for delivery ack per chat.
-        let all_chats: Vec<(String, PlatformType)> = self
-            .active_telegram_chats
-            .iter()
-            .map(|id| (id.to_string(), PlatformType::Telegram))
-            .chain(
-                self.active_slack_chats
-                    .iter()
-                    .map(|id| (id.clone(), PlatformType::Slack)),
-            )
-            .chain(
-                self.active_discord_chats
-                    .iter()
-                    .map(|id| (id.clone(), PlatformType::Discord)),
-            )
-            .collect();
-
-        // Two-phase contract: install BEFORE broadcast so a fast delivery
-        // task can't race past the install and lose its ack target. See
-        // `src/banner.rs` for the full ordering invariant.
-        let chat_ids: Vec<String> = all_chats.iter().map(|(id, _)| id.clone()).collect();
-        let ack_futures = self.banner.install_pending(&chat_ids).await;
-
-        for (chat_id, platform) in &all_chats {
-            let _ = self.stream_tx.send(StreamEvent::GapBanner {
-                chat_id: chat_id.clone(),
-                platform: *platform,
-                paused_at,
-                resumed_at,
-                gap,
-                missed_count: 0,
-            });
-        }
-
-        // Await acks (5s per chat). On timeout or dropped sender, the
-        // coordinator registers an inline-prefix fallback so the next
-        // outbound message for that chat carries the gap marker.
-        self.banner
-            .await_acks_with_fallback(ack_futures, gap, paused_at, resumed_at)
-            .await;
-
-        // 3. Slack catchup: fetch missed messages since paused_at.
-        //
-        // Spawned into a separate task so that `run_catchup`'s `cmd_tx.send`
-        // calls don't deadlock against the suspended `cmd_rx` branch in the
-        // main `tokio::select!` loop.  The spawned task runs concurrently;
-        // adapters are resumed immediately below without waiting for catchup to
-        // finish.
-        #[cfg(feature = "slack")]
-        if let Some(sp) = self.slack_platform.clone() {
-            let active: Vec<String> = self.active_slack_chats.iter().cloned().collect();
-            if !active.is_empty() {
-                // Guard against concurrent catchup tasks (e.g. two rapid GapDetected
-                // signals).  If a task is already running, skip rather than spawn a
-                // second one — the running task will cover the gap.
-                if sp
-                    .catchup_in_progress
-                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    let oldest_ts = Self::paused_at_to_slack_ts(paused_at);
-                    tracing::info!(
-                        "Triggering Slack catchup for {} channel(s) from {}",
-                        active.len(),
-                        oldest_ts
-                    );
-                    tokio::spawn(async move {
-                        let result = sp.run_catchup(&cmd_tx, &active, &oldest_ts).await;
-                        sp.catchup_in_progress.store(false, Ordering::SeqCst);
-                        match result {
-                            Ok(()) => tracing::info!("Slack catchup task complete"),
-                            Err(e) => tracing::error!("Slack catchup failed: {}", e),
-                        }
-                    });
-                } else {
-                    tracing::info!("Slack catchup already in progress, skipping duplicate spawn");
-                }
-            }
-        }
-
-        // 3b. Discord catchup: fetch missed messages since the stored snowflake watermarks.
-        //
-        // Spawned (not awaited) for the same reason as Slack catchup above:
-        // `run_catchup` calls `cmd_tx.send`, which would deadlock against the
-        // suspended `cmd_rx` branch in the main `tokio::select!` loop.
-        #[cfg(feature = "discord")]
-        if let Some(discord) = self.discord_platform.clone() {
-            // Guard against concurrent catchup tasks (e.g. two rapid GapDetected
-            // signals).  If a task is already running, skip rather than spawn a
-            // second one — the running task will cover the gap.
-            if discord
-                .catchup_in_progress
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                tokio::spawn(async move {
-                    if let Err(e) = discord.run_catchup().await {
-                        tracing::warn!("Discord catchup failed: {}", e);
-                    }
-                    discord.catchup_in_progress.store(false, Ordering::SeqCst);
-                });
-            } else {
-                tracing::warn!("Discord catchup already in progress, skipping duplicate spawn");
-            }
-        }
-
-        // 4. Resume all adapters via trait method.
-        for p in [&self.telegram, &self.slack, &self.discord]
-            .into_iter()
-            .flatten()
-        {
-            p.resume().await;
-        }
-        tracing::info!("Adapters resumed after gap handling");
-    }
-
-    /// Convert a `DateTime<Utc>` to a Slack-format message timestamp.
     ///
-    /// Slack timestamps are `"{unix_seconds}.{microseconds:06}"`.
-    /// This format is monotonic per-channel and used as the `oldest` parameter
-    /// for `conversations.history` catchup calls.
-    #[cfg(feature = "slack")]
-    fn paused_at_to_slack_ts(dt: DateTime<Utc>) -> String {
-        format!("{}.{:06}", dt.timestamp(), dt.timestamp_subsec_micros())
+    /// Pass-through to [`WakeCoordinator::handle_gap`]. The dispatch context
+    /// is constructed inline (NOT via a getter) so the borrow checker sees
+    /// field-level disjoint borrows — see [`WakeDispatchContext`] for the
+    /// full rationale, mirroring the same pattern in `harness_registry`.
+    pub async fn handle_gap(&mut self, signal: PowerSignal, cmd_tx: mpsc::Sender<IncomingMessage>) {
+        let dispatch = WakeDispatchContext {
+            telegram: self.telegram.as_deref(),
+            slack: self.slack.as_deref(),
+            discord: self.discord.as_deref(),
+            #[cfg(feature = "slack")]
+            slack_platform: self.slack_platform.as_ref(),
+            #[cfg(feature = "discord")]
+            discord_platform: self.discord_platform.as_ref(),
+            stream_tx: &self.stream_tx,
+            banner: &self.banner,
+        };
+        self.wake.handle_gap(signal, cmd_tx, &dispatch).await;
     }
 
     /// Apply a `StateUpdate` and let the persistor decide whether to flush
-    /// to disk now or defer to the debounce window. Also tracks active chat
-    /// IDs as they bind (kept on `App` because the live sets are read by
-    /// `handle_gap` and `emit_startup_gap_banners`, neither of which the
-    /// persistor knows about).
+    /// to disk now or defer to the debounce window. Forwards `Bind*Chat`
+    /// updates to the wake coordinator so its active-chat sets stay in
+    /// sync with the persisted state.
     pub async fn apply_state_update(&mut self, update: StateUpdate) {
-        match &update {
-            StateUpdate::BindTelegramChat(id) => {
-                self.active_telegram_chats.insert(*id);
-            }
-            StateUpdate::BindSlackChat(id) => {
-                self.active_slack_chats.insert(id.clone());
-            }
-            StateUpdate::BindDiscordChat(id) => {
-                self.active_discord_chats.insert(id.clone());
-            }
-            _ => {}
-        }
+        self.wake.apply_bind(&update);
         self.state_persistor.apply(update);
     }
 
@@ -670,10 +463,12 @@ impl App {
         // pollute active_telegram_chats or trigger gap banners.
         if msg.reply_context.socket_reply_tx.is_none() {
             // Bind chat IDs for active platform (so we know which chats to banner).
+            // Each `wake.insert_*_chat` returns true iff the chat was newly
+            // added — only then do we send the corresponding StateUpdate.
             match msg.reply_context.platform {
                 PlatformType::Telegram => {
                     if let Ok(id) = msg.reply_context.chat_id.parse::<i64>() {
-                        if self.active_telegram_chats.insert(id) {
+                        if self.wake.insert_telegram_chat(id) {
                             if let Err(e) =
                                 self.state_tx.try_send(StateUpdate::BindTelegramChat(id))
                             {
@@ -684,7 +479,7 @@ impl App {
                 }
                 PlatformType::Slack => {
                     let id = msg.reply_context.chat_id.clone();
-                    if self.active_slack_chats.insert(id.clone()) {
+                    if self.wake.insert_slack_chat(id.clone()) {
                         if let Err(e) = self.state_tx.try_send(StateUpdate::BindSlackChat(id)) {
                             tracing::warn!("state_tx full, update dropped: {}", e);
                         }
@@ -692,7 +487,7 @@ impl App {
                 }
                 PlatformType::Discord => {
                     let id = msg.reply_context.chat_id.clone();
-                    if self.active_discord_chats.insert(id.clone()) {
+                    if self.wake.insert_discord_chat(id.clone()) {
                         if let Err(e) = self.state_tx.try_send(StateUpdate::BindDiscordChat(id)) {
                             tracing::warn!("state_tx full, update dropped: {}", e);
                         }
@@ -1480,7 +1275,7 @@ patterns = []
         let config = make_test_config(dir.path());
         let store = StateStore::load(&state_path).unwrap();
         let (state_tx, _state_rx) = mpsc::channel::<StateUpdate>(64);
-        let mut app = App::new(&config, store, state_tx).unwrap();
+        let app = App::new(&config, store, state_tx).unwrap();
 
         // Subscribe before emitting.
         let mut sub = app.subscribe_stream();
@@ -1519,7 +1314,7 @@ patterns = []
         let config = make_test_config(dir.path());
         let store = StateStore::load(dir.path().join("terminus-state.json")).unwrap();
         let (state_tx, _state_rx) = mpsc::channel::<StateUpdate>(64);
-        let mut app = App::new(&config, store, state_tx).unwrap();
+        let app = App::new(&config, store, state_tx).unwrap();
 
         let mut sub = app.subscribe_stream();
         app.emit_startup_gap_banners();
@@ -1547,7 +1342,7 @@ patterns = []
         let config = make_test_config(dir.path());
         let store = StateStore::load(dir.path().join("terminus-state.json")).unwrap();
         let (state_tx, _state_rx) = mpsc::channel::<StateUpdate>(64);
-        let mut app = App::new(&config, store, state_tx).unwrap();
+        let app = App::new(&config, store, state_tx).unwrap();
 
         let mut sub = app.subscribe_stream();
         app.emit_startup_gap_banners();
@@ -1589,7 +1384,7 @@ patterns = []
         let (mut app, _state_rx) = make_app(dir.path());
 
         // Seed an active Telegram chat so handle_gap has a chat to emit for.
-        app.active_telegram_chats.insert(7777i64);
+        app.wake.insert_telegram_chat(7777i64);
 
         // A background task imitating the delivery task: subscribe to the
         // stream, and whenever a GapBanner arrives, resolve the matching
@@ -1680,8 +1475,8 @@ patterns = []
 
         // Check in-memory set was updated.
         assert!(
-            app.active_discord_chats.contains("discord_channel_42"),
-            "active_discord_chats should contain the chat ID"
+            app.wake.contains_discord_chat("discord_channel_42"),
+            "wake's active discord chat set should contain the chat ID"
         );
 
         // Drain state_rx to find BindDiscordChat.
@@ -2368,19 +2163,8 @@ patterns = []
     // Step 4 tests
     // -------------------------------------------------------------------------
 
-    #[cfg(feature = "slack")]
-    #[test]
-    fn test_paused_at_to_slack_ts_format() {
-        // Verify the Slack timestamp format: "{unix_secs}.{microseconds:06}"
-        use chrono::TimeZone;
-        let dt = Utc.timestamp_opt(1_000_000_000, 123_456_000).unwrap();
-        let ts = App::paused_at_to_slack_ts(dt);
-        // 1_000_000_000 seconds, 123_456 microseconds (from 123_456_000 nanos)
-        assert_eq!(
-            ts, "1000000000.123456",
-            "Slack ts format must be {{unix_secs}}.{{microseconds:06}}"
-        );
-    }
+    // `test_paused_at_to_slack_ts_format` migrated to `src/wake.rs::tests`
+    // along with the `paused_at_to_slack_ts` helper.
 
     #[cfg(feature = "slack")]
     #[tokio::test]
@@ -2407,7 +2191,7 @@ patterns = []
         app.slack_platform = Some(platform);
 
         // Seed a Telegram chat so GapBanner is emitted and acked by a mock task.
-        app.active_telegram_chats.insert(7777i64);
+        app.wake.insert_telegram_chat(7777i64);
 
         let acks = app.pending_banner_acks_handle();
         let mut rx = app.subscribe_stream();
@@ -2471,7 +2255,7 @@ patterns = []
         app.discord_platform = Some(Arc::clone(&adapter));
 
         // Seed a Telegram chat so GapBanner is emitted and acked by a mock task.
-        app.active_telegram_chats.insert(7777i64);
+        app.wake.insert_telegram_chat(7777i64);
 
         let acks = app.pending_banner_acks_handle();
         let mut rx = app.subscribe_stream();
