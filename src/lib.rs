@@ -21,6 +21,7 @@ pub mod harness;
 pub mod power;
 pub mod session;
 pub mod socket;
+pub mod state_persistor;
 pub mod state_store;
 pub mod structured_output;
 pub mod tmux;

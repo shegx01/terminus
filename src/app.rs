@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 #[cfg(feature = "slack")]
@@ -33,6 +33,7 @@ use crate::harness::{build_session_key, drive_harness, Harness, HarnessContext, 
 use crate::power::types::PowerSignal;
 use crate::session::{self, SessionManager};
 use crate::socket::events::AmbientEvent;
+use crate::state_persistor::StatePersistor;
 use crate::state_store::{NamedSessionEntry, StateStore, StateUpdate};
 use crate::structured_output::{spawn_retry_worker, DeliveryQueue, SchemaRegistry, WebhookClient};
 use crate::tmux::TmuxClient;
@@ -69,8 +70,12 @@ pub struct App {
     max_named_sessions: usize,
 
     // ── Sleep/wake recovery state ─────────────────────────────────────────────
-    /// Owned state store (single owner — adapters send updates via mpsc).
-    store: StateStore,
+    /// State store + debounce-or-force-persist policy + first-interaction
+    /// dirty guard. See `src/state_persistor.rs` for the extracted
+    /// implementation. App owns it; the rest of the system writes through
+    /// either `state_tx` (which the main loop drains and forwards to
+    /// `apply_state_update`) or via direct method calls on `App`.
+    state_persistor: StatePersistor,
     /// mpsc sender to push `StateUpdate`s into the App's `state_rx` channel.
     /// Kept here so `App` itself can send updates (e.g. `MarkDirty`, `Tick`).
     state_tx: mpsc::Sender<StateUpdate>,
@@ -85,16 +90,11 @@ pub struct App {
     /// Shared via `Arc<AsyncMutex<_>>` so the map can be locked briefly
     /// from either side without holding across await boundaries in `handle_gap`.
     pending_banner_acks: PendingBannerAcks,
-    /// Debounce counters for `store.persist()`.
-    last_state_persist: Instant,
-    updates_since_persist: u32,
     /// Inline fallback gap prefixes: if banner delivery times out, store here
     /// and prepend `[gap: Xm Ys]` to the next message for that chat.
     /// Shared via `Arc<AsyncMutex<_>>` so delivery tasks can consume entries
     /// without going through the main `tokio::select!` loop.
     gap_prefix: GapPrefixes,
-    /// Whether we have already sent a `MarkDirty` update to state.
-    dirty_sent: bool,
     /// Snapshot of `last_clean_shutdown` from the state file *before* we
     /// applied `MarkDirty` on startup.  Used by `emit_startup_gap_banners`
     /// to check whether the previous run exited cleanly.
@@ -213,7 +213,21 @@ impl App {
             );
         }
 
-        let mut app = Self {
+        // Wrap the loaded store in the persistor. We do NOT apply MarkDirty
+        // yet — `startup_was_clean` was captured above from the pre-dirty
+        // snapshot, and we want the dirty marker on disk before constructing
+        // the rest of `App`.
+        let mut state_persistor = StatePersistor::new(store);
+
+        // Immediately mark state dirty (sets last_clean_shutdown=false) and
+        // force-persist so a crash within the first ~5s (before the debounce
+        // window fires) still triggers a restart banner on the next boot.
+        // Bubble persist failures up: the restart-banner gate depends on this
+        // write completing, so we'd rather fail App::new than silently boot
+        // with a dirty bit only in memory.
+        state_persistor.apply_force(StateUpdate::MarkDirty)?;
+
+        let app = Self {
             blocklist,
             session_mgr,
             buffers: HashMap::new(),
@@ -230,16 +244,13 @@ impl App {
             trigger,
             named_harness_sessions,
             max_named_sessions: config.harness.max_named_sessions.unwrap_or(50),
-            store,
+            state_persistor,
             state_tx,
             active_telegram_chats,
             active_slack_chats,
             active_discord_chats,
             pending_banner_acks: Arc::new(AsyncMutex::new(HashMap::new())),
-            last_state_persist: Instant::now(),
-            updates_since_persist: 0,
             gap_prefix: Arc::new(AsyncMutex::new(HashMap::new())),
-            dirty_sent: false,
             startup_was_clean,
             schema_registry: Arc::clone(&schema_registry),
             delivery_queue: Arc::clone(&delivery_queue),
@@ -252,12 +263,6 @@ impl App {
             gemini,
             codex,
         };
-
-        // Immediately mark state dirty in memory (sets last_clean_shutdown=false)
-        // and force-persist to disk so a crash within the first ~5s (before the
-        // debounce window fires) still triggers a restart banner on the next boot.
-        app.store.apply(StateUpdate::MarkDirty);
-        app.store.persist()?;
 
         // Spawn the retry worker with the broadcast sender's subscribe handle.
         // We subscribe once here; the worker holds its own receiver.
@@ -341,19 +346,19 @@ impl App {
     /// Call this before constructing the `TelegramAdapter` with
     /// `.with_initial_offset(...)`.
     pub fn initial_telegram_offset(&self) -> i64 {
-        self.store.snapshot().telegram.offset
+        self.state_persistor.snapshot().telegram.offset
     }
 
     /// Returns the per-channel Slack watermarks from the persisted state snapshot.
     /// Call this before `seed_watermarks` on `SlackPlatform`.
     pub fn initial_slack_watermarks(&self) -> std::collections::HashMap<String, String> {
-        self.store.snapshot().slack_watermarks.clone()
+        self.state_persistor.snapshot().slack_watermarks.clone()
     }
 
     /// Returns the per-channel Discord snowflake watermarks from the persisted state snapshot.
     /// Pass to `DiscordAdapter::new` as `initial_watermarks`.
     pub fn initial_discord_watermarks(&self) -> std::collections::HashMap<String, u64> {
-        self.store.snapshot().discord_watermarks.clone()
+        self.state_persistor.snapshot().discord_watermarks.clone()
     }
 
     pub async fn reconcile_startup(&mut self) {
@@ -424,7 +429,7 @@ impl App {
     /// Emit gap banners for any active chats if we detect an unclean restart
     /// with a wall gap > 30s.  Call this once after `reconcile_startup()`.
     pub fn emit_startup_gap_banners(&mut self) {
-        let snapshot = self.store.snapshot().clone();
+        let snapshot = self.state_persistor.snapshot().clone();
         let now = Utc::now();
         let last_seen = match snapshot.last_seen_wall {
             Some(t) => t,
@@ -708,11 +713,12 @@ impl App {
         format!("{}.{:06}", dt.timestamp(), dt.timestamp_subsec_micros())
     }
 
-    /// Apply a `StateUpdate` to in-memory state and debounce persists.
-    ///
-    /// Persists when: >= 10 updates accumulated OR >= 5s since last persist.
+    /// Apply a `StateUpdate` and let the persistor decide whether to flush
+    /// to disk now or defer to the debounce window. Also tracks active chat
+    /// IDs as they bind (kept on `App` because the live sets are read by
+    /// `handle_gap` and `emit_startup_gap_banners`, neither of which the
+    /// persistor knows about).
     pub async fn apply_state_update(&mut self, update: StateUpdate) {
-        // Track active chat IDs as they bind.
         match &update {
             StateUpdate::BindTelegramChat(id) => {
                 self.active_telegram_chats.insert(*id);
@@ -725,43 +731,14 @@ impl App {
             }
             _ => {}
         }
-        // Safety-critical variants bypass the debounce window so a crash
-        // immediately after cannot leave the on-disk state inconsistent.
-        // Named-session batches must force-persist too: a user expects
-        // `--resume foo` to work after process restart, and without this
-        // an unclean exit between the prompt and the next 10 updates / 5s
-        // window would silently drop the session from disk.
-        let force = matches!(
-            &update,
-            StateUpdate::MarkDirty
-                | StateUpdate::SetCleanShutdown(_)
-                | StateUpdate::HarnessSessionBatch(_)
-                | StateUpdate::SlackWatermark { .. }
-                | StateUpdate::DiscordWatermark { .. }
-        );
-        self.store.apply(update);
-        self.updates_since_persist += 1;
-        if force
-            || self.updates_since_persist >= 10
-            || self.last_state_persist.elapsed() >= Duration::from_secs(5)
-        {
-            if let Err(e) = self.store.persist() {
-                tracing::error!("Failed to persist state: {}", e);
-            }
-            self.last_state_persist = Instant::now();
-            self.updates_since_persist = 0;
-        }
+        self.state_persistor.apply(update);
     }
 
-    /// Mark last_clean_shutdown=true and force-persist.  Called on graceful
+    /// Mark last_clean_shutdown=true, force-persist, and wake the retry
+    /// worker so it can break out of an idle sleep. Called on graceful
     /// ctrl-c before `cleanup()`.
     pub async fn mark_clean_shutdown(&mut self) {
-        self.store.apply(StateUpdate::SetCleanShutdown(true));
-        if let Err(e) = self.store.persist() {
-            tracing::error!("Failed to persist clean-shutdown state: {}", e);
-        } else {
-            tracing::info!("Clean shutdown persisted");
-        }
+        self.state_persistor.mark_clean_shutdown();
         // Signal the retry worker to stop after completing its current job.
         // Set the atomic flag FIRST so any next non-blocking poll sees `true`,
         // then notify so an idle/backoff sleep wakes immediately.
@@ -780,11 +757,10 @@ impl App {
 
     pub async fn handle_command(&mut self, msg: &IncomingMessage) {
         // Ensure MarkDirty is sent on the first real user interaction.
-        if !self.dirty_sent {
+        if self.state_persistor.claim_dirty_send() {
             if let Err(e) = self.state_tx.try_send(StateUpdate::MarkDirty) {
                 tracing::warn!("state_tx full, update dropped: {}", e);
             }
-            self.dirty_sent = true;
         }
 
         // Emit ChatForward ambient event for chat-origin messages (not socket).
@@ -1841,60 +1817,22 @@ patterns = []
     }
 
     // ─── Sleep/wake recovery tests ───────────────────────────────────────────
-
-    #[tokio::test]
-    async fn apply_state_update_debounces_below_threshold() {
-        let dir = tempdir().unwrap();
-        let (mut app, _state_rx) = make_app(dir.path());
-
-        // Apply 5 updates — below the 10-update threshold and under 5s.
-        for i in 0..5i64 {
-            app.apply_state_update(StateUpdate::TelegramOffset(i)).await;
-        }
-        // persist should NOT have been called yet (5 < 10, and < 5s elapsed).
-        assert_eq!(app.updates_since_persist, 5);
-    }
-
-    #[tokio::test]
-    async fn apply_state_update_persists_at_threshold() {
-        let dir = tempdir().unwrap();
-        let (mut app, _state_rx) = make_app(dir.path());
-
-        // Apply exactly 10 updates — should trigger a persist.
-        for i in 0..10i64 {
-            app.apply_state_update(StateUpdate::TelegramOffset(i)).await;
-        }
-        // After persist, counter resets to 0.
-        assert_eq!(app.updates_since_persist, 0);
-        // State file should exist.
-        assert!(dir.path().join("terminus-state.json").exists());
-    }
-
-    #[tokio::test]
-    async fn mark_clean_shutdown_persists_true() {
-        let dir = tempdir().unwrap();
-        let (mut app, _state_rx) = make_app(dir.path());
-
-        // Trigger some activity.
-        app.apply_state_update(StateUpdate::TelegramOffset(1)).await;
-        app.mark_clean_shutdown().await;
-
-        // Reload from disk and check.
-        let reloaded = StateStore::load(dir.path().join("terminus-state.json")).unwrap();
-        assert!(
-            reloaded.snapshot().last_clean_shutdown,
-            "mark_clean_shutdown should persist last_clean_shutdown=true"
-        );
-    }
+    //
+    // The pure-persistor cases (`apply_*` debounce, `mark_clean_shutdown`)
+    // live in `src/state_persistor.rs` next to the type they exercise. The
+    // App-level integration tests below pin behavior that the persistor
+    // can't see in isolation: chat-set tracking, the startup MarkDirty
+    // happening through the App constructor, and the force-persist path
+    // when reached via `apply_state_update`.
 
     #[tokio::test]
     async fn app_new_marks_dirty_in_memory() {
         let dir = tempdir().unwrap();
         let (app, _state_rx) = make_app(dir.path());
-        // App::new applies MarkDirty immediately.
+        // App::new applies MarkDirty immediately via the persistor.
         assert!(
-            !app.store.snapshot().last_clean_shutdown,
-            "App::new should mark store dirty (last_clean_shutdown=false)"
+            !app.state_persistor.snapshot().last_clean_shutdown,
+            "App::new should mark state dirty (last_clean_shutdown=false)"
         );
     }
 
@@ -2191,7 +2129,8 @@ patterns = []
 
         // Counter should have been reset by the force-persist.
         assert_eq!(
-            app.updates_since_persist, 0,
+            app.state_persistor.updates_since_persist(),
+            0,
             "HarnessSessionBatch must bypass the debounce window"
         );
 

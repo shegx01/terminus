@@ -8,6 +8,7 @@ mod harness;
 mod power;
 mod session;
 mod socket;
+mod state_persistor;
 mod state_store;
 mod structured_output;
 mod tmux;
